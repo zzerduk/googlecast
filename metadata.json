@@ -1,0 +1,6 @@
+{
+  "name": "ScreenCast Audio",
+  "description": "Ultra-low-latency ADTS AAC audio-only caster for 1st-Gen Google Home and Chromecast speakers over Cast V2 and Ktor chunked HTTP streaming.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

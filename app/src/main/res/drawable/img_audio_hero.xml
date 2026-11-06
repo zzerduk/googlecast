@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="320dp"
+    android:height="140dp"
+    android:viewportWidth="320"
+    android:viewportHeight="140">
+    <path android:pathData="M0,0h320v140h-320z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="0"
+                android:startY="0"
+                android:endX="320"
+                android:endY="140"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#0D131E" />
+                <item android:offset="0.5" android:color="#162032" />
+                <item android:offset="1.0" android:color="#0F172A" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- Acoustic wave lines left to right -->
+    <path
+        android:strokeColor="#3300E5FF"
+        android:strokeWidth="2"
+        android:pathData="M0,70 Q40,20 80,70 T160,70 T240,70 T320,70" />
+    <path
+        android:strokeColor="#55FF9100"
+        android:strokeWidth="2.5"
+        android:pathData="M0,78 Q40,120 80,78 T160,78 T240,78 T320,78" />
+    <path
+        android:strokeColor="#8800E5FF"
+        android:strokeWidth="1.5"
+        android:pathData="M0,62 Q50,35 100,62 T200,62 T320,62" />
+    <!-- Stylized 1st-Gen Google Home speaker in center-right -->
+    <path
+        android:fillColor="#ECEFF4"
+        android:pathData="M236,38 L278,30 L278,102 C278,109 268,114 257,114 C246,114 236,109 236,102 Z" />
+    <path
+        android:fillColor="#FF9100"
+        android:pathData="M236,72 L278,72 L278,102 C278,109 268,114 257,114 C246,114 236,109 236,102 Z" />
+    <path
+        android:fillColor="#111827"
+        android:pathData="M236,36 C236,31 246,27 257,27 C268,27 278,31 278,36 C278,41 268,45 257,45 C246,45 236,41 236,36 Z" />
+    <path
+        android:fillColor="#00E5FF"
+        android:pathData="M250,36 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+    <path
+        android:fillColor="#FF9100"
+        android:pathData="M257,33 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+    <path
+        android:fillColor="#FFD600"
+        android:pathData="M264,36 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+    <path
+        android:fillColor="#00E676"
+        android:pathData="M257,39 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+</vector>

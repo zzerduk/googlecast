@@ -43,9 +43,13 @@ googleid = "1.1.1"
 ktor = "2.3.12"
 castFramework = "22.3.1"
 webrtcSdk = "125.6422.07"
+fragmentKtx = "1.8.6"
+appcompat = "1.7.0"
 
 
 [libraries]
+androidx-fragment-ktx = { group = "androidx.fragment", name = "fragment-ktx", version.ref = "fragmentKtx" }
+androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
 ktor-server-core = { group = "io.ktor", name = "ktor-server-core-jvm", version.ref = "ktor" }
 ktor-server-cio = { group = "io.ktor", name = "ktor-server-cio-jvm", version.ref = "ktor" }
 play-services-cast-framework = { group = "com.google.android.gms", name = "play-services-cast-framework", version.ref = "castFramework" }

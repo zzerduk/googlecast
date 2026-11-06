@@ -25,6 +25,7 @@ import io.github.ddagunts.screencast.cast.CastSdkSessionController
 import io.github.ddagunts.screencast.cast.CastSignalingChannel
 import io.github.ddagunts.screencast.cast.CastV2ChannelClient
 import io.github.ddagunts.screencast.webrtc.WebRtcAudioSession
+import io.github.ddagunts.screencast.webrtc.WebRtcCleanupTimeoutException
 import io.github.ddagunts.screencast.webrtc.WebRtcStage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -61,12 +62,56 @@ object AudioCastSessionCoordinator {
     @Volatile
     var selectedDevice: CastDeviceModel? = null
 
+    @Volatile
+    var isCaptureLocked: Boolean = false
+        private set
+
     fun updateConfig(transform: (AudioStreamConfig) -> AudioStreamConfig) {
+        if (isCaptureLocked) return
         _config.update(transform)
     }
 
     fun updateTelemetry(transform: (AudioPipelineTelemetry) -> AudioPipelineTelemetry) {
-        _telemetry.update(transform)
+        _telemetry.update { current ->
+            val updated = transform(current)
+            if (isCaptureLocked || current.isCaptureLocked || current.webRtcStage == WebRtcStage.CLEANUP_TIMEOUT) {
+                isCaptureLocked = true
+                updated.copy(
+                    isStreaming = false,
+                    isSessionActive = false,
+                    webRtcStage = WebRtcStage.CLEANUP_TIMEOUT,
+                    isCaptureLocked = true,
+                    error = current.error ?: updated.error
+                        ?: "Native audio cleanup timed out; capture is locked in this process."
+                )
+            } else {
+                updated
+            }
+        }
+    }
+
+    fun markCleanupTimeout(message: String) {
+        isCaptureLocked = true
+        _telemetry.update { current ->
+            current.copy(
+                isStreaming = false,
+                isSessionActive = false,
+                webRtcStage = WebRtcStage.CLEANUP_TIMEOUT,
+                isCaptureLocked = true,
+                error = message
+            )
+        }
+        appendLog("Audio cast cleanup timed out: $message")
+    }
+
+    internal fun resetForTesting() {
+        isCaptureLocked = false
+        selectedDevice = null
+        _config.value = AudioStreamConfig()
+        _telemetry.value = AudioPipelineTelemetry()
+        _protocolLogs.value = listOf(
+            "Ready: WebRTC audio receiver 9098830C; AAC receiver CC1AD845 remains available."
+        )
     }
 
     fun appendLog(message: String) {
@@ -116,6 +161,7 @@ class AudioCastCaptureService : Service() {
     @Volatile private var generation = 0L
     private var stopping = false
     private var destroyed = false
+    private var cleanupTimedOut = false
     private var mediaProjection: MediaProjection? = null
     private var projectionCallback: MediaProjection.Callback? = null
     private var webRtcSession: WebRtcAudioSession? = null
@@ -129,10 +175,15 @@ class AudioCastCaptureService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP_AUDIO_CAST -> {
+                if (cleanupTimedOut || AudioCastSessionCoordinator.isCaptureLocked) {
+                    return START_NOT_STICKY
+                }
                 stopCastingSession()
             }
             ACTION_START_AUDIO_CAST -> {
-                if (activeMode != null || stopping) return START_NOT_STICKY
+                if (activeMode != null || stopping || cleanupTimedOut || AudioCastSessionCoordinator.isCaptureLocked) {
+                    return START_NOT_STICKY
+                }
                 val mode = intent.getStringExtra(EXTRA_MODE)?.let { value ->
                     AudioCastMode.entries.firstOrNull { it.name == value }
                 } ?: AudioCastSessionCoordinator.config.value.mode
@@ -145,7 +196,11 @@ class AudioCastCaptureService : Service() {
                 }
                 startCastingPipeline(mode, resultCode, resultData)
             }
-            else -> stopSelf()
+            else -> {
+                if (!cleanupTimedOut && !AudioCastSessionCoordinator.isCaptureLocked) {
+                    stopSelf()
+                }
+            }
         }
         return START_NOT_STICKY
     }
@@ -155,16 +210,35 @@ class AudioCastCaptureService : Service() {
         val notification = buildForegroundNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            if (mode == AudioCastMode.WEBRTC && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val hasRecordAudioPermission = ContextCompat.checkSelfPermission(
+                this,
+                android.Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                (mode == AudioCastMode.WEBRTC || hasRecordAudioPermission)
+            ) {
                 types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             }
-            startForeground(NOTIFICATION_ID, notification, types)
+            try {
+                startForeground(NOTIFICATION_ID, notification, types)
+            } catch (e: SecurityException) {
+                if (types != ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION) {
+                    startForeground(
+                        NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                    )
+                } else {
+                    throw e
+                }
+            }
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
     }
 
     private fun startCastingPipeline(mode: AudioCastMode, resultCode: Int, resultData: Intent?) {
+        if (AudioCastSessionCoordinator.isCaptureLocked) return
         activeMode = mode
         val token = ++generation
         AudioCastSessionCoordinator.updateTelemetry {
@@ -197,7 +271,7 @@ class AudioCastCaptureService : Service() {
             mediaProjection = projection
             val callback = object : MediaProjection.Callback() {
                 override fun onStop() {
-                    if (generation == token && !stopping) {
+                    if (generation == token && !stopping && !cleanupTimedOut) {
                         stopCastingSession("MediaProjection authorization was revoked.")
                     }
                 }
@@ -221,7 +295,12 @@ class AudioCastCaptureService : Service() {
             context = applicationContext,
             channel = channel,
             onStage = { stage ->
-                if (generation == token && !stopping) {
+                if (stage == WebRtcStage.CLEANUP_TIMEOUT) {
+                    AudioCastSessionCoordinator.markCleanupTimeout(
+                        AudioCastSessionCoordinator.telemetry.value.error
+                            ?: "WebRTC native audio cleanup timed out; capture is locked in this process."
+                    )
+                } else if (generation == token && !stopping) {
                     AudioCastSessionCoordinator.updateTelemetry {
                         it.copy(
                             webRtcStage = stage,
@@ -243,7 +322,7 @@ class AudioCastCaptureService : Service() {
                 }
             },
             onPcmStats = { stats ->
-                if (generation == token) {
+                if (generation == token && !stopping) {
                     AudioCastSessionCoordinator.updateTelemetry {
                         it.copy(
                             pcmChunksRead = stats.chunksRead,
@@ -265,7 +344,7 @@ class AudioCastCaptureService : Service() {
                 }
             },
             onLog = { message ->
-                if (generation == token) AudioCastSessionCoordinator.appendLog(message)
+                if (generation == token || stopping) AudioCastSessionCoordinator.appendLog(message)
             }
         )
         webRtcSession = session
@@ -287,7 +366,9 @@ class AudioCastCaptureService : Service() {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                if (generation == token) stopCastingSession(e.message ?: "WebRTC initialization failed.")
+                if (generation == token && !stopping) {
+                    stopCastingSession(e.message ?: "WebRTC initialization failed.")
+                }
             }
         }
     }
@@ -329,7 +410,8 @@ class AudioCastCaptureService : Service() {
                     }
                 }
             },
-            onEngineLog = { msg -> AudioCastSessionCoordinator.appendLog(msg) }
+            onEngineLog = { msg -> AudioCastSessionCoordinator.appendLog(msg) },
+            context = applicationContext
         )
         captureEngine = engine
 
@@ -367,10 +449,10 @@ class AudioCastCaptureService : Service() {
     }
 
     private fun stopCastingSession(error: String? = null) {
-        if (stopping) return
+        if (stopping || cleanupTimedOut) return
         if (activeMode == null) {
             if (error != null) AudioCastSessionCoordinator.updateTelemetry { it.copy(error = error) }
-            if (!destroyed) stopSelf()
+            if (!destroyed && !AudioCastSessionCoordinator.isCaptureLocked) stopSelf()
             return
         }
         stopping = true
@@ -382,6 +464,13 @@ class AudioCastCaptureService : Service() {
         if (mode != AudioCastMode.WEBRTC) startingJob?.cancel()
         castStatusJob?.cancel()
         castStatusJob = null
+
+        // Unregister MediaProjection callback immediately during logical stop so late callbacks are ignored.
+        projectionCallback?.let { callback ->
+            runCatching { mediaProjection?.unregisterCallback(callback) }
+        }
+        projectionCallback = null
+
         AudioCastSessionCoordinator.updateTelemetry {
             it.copy(
                 isStreaming = false,
@@ -391,61 +480,100 @@ class AudioCastCaptureService : Service() {
         }
         if (error != null) AudioCastSessionCoordinator.appendLog("Audio cast failed: $error")
         stopJob = teardownScope.launch {
+            var timedOutCleanup = false
+            var nativeCleanupFailed = false
+            val session = webRtcSession
+            webRtcSession = null
             try {
                 try {
-                    webRtcSession?.stop()
+                    session?.stop()
+                } catch (e: WebRtcCleanupTimeoutException) {
+                    timedOutCleanup = true
+                    finalError = e.message ?: "WebRTC native audio cleanup timed out."
                 } catch (e: Exception) {
-                    AudioCastSessionCoordinator.appendLog("WebRTC cleanup: ${e.message}")
-                    finalError = finalError ?: "WebRTC cleanup failed: ${e.message}"
-                    webRtcSession?.close()
+                    if (session?.isCleanupTimedOut == true) {
+                        timedOutCleanup = true
+                        finalError = e.message ?: "WebRTC native audio cleanup timed out."
+                    } else {
+                        nativeCleanupFailed = true
+                        AudioCastSessionCoordinator.appendLog("WebRTC cleanup: ${e.message}")
+                        finalError = finalError ?: "WebRTC cleanup failed: ${e.message}"
+                        session?.close()
+                    }
                 }
-                webRtcSession = null
+                if (session?.isCleanupTimedOut == true) {
+                    timedOutCleanup = true
+                }
                 startingJob?.cancel()
-                startingJob?.join()
+                if (!timedOutCleanup) {
+                    startingJob?.join()
+                }
                 webRtcChannel?.endSession()
                 webRtcChannel = null
-                withContext(Dispatchers.IO) {
-                    runCatching { castClient?.disconnect() }
-                    castClient = null
-                    runCatching { captureEngine?.release() }.onFailure {
-                        finalError = finalError ?: "AAC cleanup failed: ${it.message}"
+                if (!timedOutCleanup) {
+                    withContext(Dispatchers.IO) {
+                        runCatching { castClient?.disconnect() }
+                        castClient = null
+                        runCatching { captureEngine?.release() }.onFailure {
+                            nativeCleanupFailed = true
+                            finalError = finalError ?: "AAC cleanup failed: ${it.message}"
+                        }
+                        captureEngine = null
+                        runCatching { ktorServer?.stopServer() }.onFailure {
+                            finalError = finalError ?: "AAC server cleanup failed: ${it.message}"
+                        }
+                        ktorServer = null
                     }
-                    captureEngine = null
-                    runCatching { ktorServer?.stopServer() }.onFailure {
-                        finalError = finalError ?: "AAC server cleanup failed: ${it.message}"
-                    }
-                    ktorServer = null
                 }
             } finally {
-                val projection = mediaProjection
-                mediaProjection = null
-                projectionCallback?.let { callback ->
-                    runCatching { projection?.unregisterCallback(callback) }
-                }
-                projectionCallback = null
-                runCatching { projection?.stop() }.onFailure {
-                    finalError = finalError ?: "MediaProjection cleanup failed: ${it.message}"
-                }
-                activeMode = null
-                stopping = false
-                if (!destroyed) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
-                }
-                AudioCastSessionCoordinator.updateTelemetry {
-                    AudioPipelineTelemetry(
-                        webRtcStage = if (finalError != null && mode == AudioCastMode.WEBRTC) {
-                            WebRtcStage.ERROR
-                        } else {
-                            WebRtcStage.IDLE
-                        },
-                        error = finalError
+                if (timedOutCleanup) {
+                    cleanupTimedOut = true
+                    activeMode = null
+                    stopping = false
+                    val timeoutMessage = finalError
+                        ?: "WebRTC native audio cleanup timed out; capture is locked in this process."
+                    AudioCastSessionCoordinator.markCleanupTimeout(timeoutMessage)
+                    if (!destroyed) {
+                        val nm = getSystemService(NotificationManager::class.java)
+                        nm?.notify(
+                            NOTIFICATION_ID,
+                            buildForegroundNotification(
+                                isCleanupTimedOut = true,
+                                timeoutMessage = timeoutMessage
+                            )
+                        )
+                    }
+                } else {
+                    val projection = mediaProjection
+                    mediaProjection = null
+                    if (!nativeCleanupFailed && projection != null) {
+                        withContext(Dispatchers.IO) {
+                            runCatching { projection.stop() }.onFailure {
+                                finalError = finalError ?: "MediaProjection cleanup failed: ${it.message}"
+                            }
+                        }
+                    }
+                    activeMode = null
+                    stopping = false
+                    if (!destroyed) {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
+                    AudioCastSessionCoordinator.updateTelemetry {
+                        AudioPipelineTelemetry(
+                            webRtcStage = if (finalError != null && mode == AudioCastMode.WEBRTC) {
+                                WebRtcStage.ERROR
+                            } else {
+                                WebRtcStage.IDLE
+                            },
+                            error = finalError
+                        )
+                    }
+                    AudioCastSessionCoordinator.appendLog(
+                        if (finalError == null) "Audio cast session stopped."
+                        else "Audio cast stopped with error: $finalError"
                     )
                 }
-                AudioCastSessionCoordinator.appendLog(
-                    if (finalError == null) "Audio cast session stopped."
-                    else "Audio cast stopped with error: $finalError"
-                )
                 if (destroyed) teardownScope.cancel()
             }
         }
@@ -471,7 +599,10 @@ class AudioCastCaptureService : Service() {
         }
     }
 
-    private fun buildForegroundNotification(): Notification {
+    private fun buildForegroundNotification(
+        isCleanupTimedOut: Boolean = false,
+        timeoutMessage: String? = null
+    ): Notification {
         val openIntent = Intent(this, MainActivity::class.java)
         val pendingOpen = PendingIntent.getActivity(
             this,
@@ -480,34 +611,41 @@ class AudioCastCaptureService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val stopIntent = Intent(this, AudioCastCaptureService::class.java).apply {
-            action = ACTION_STOP_AUDIO_CAST
-        }
-        val pendingStop = PendingIntent.getService(
-            this,
-            1,
-            stopIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle(getString(R.string.notification_title))
+            .setContentTitle(
+                if (isCleanupTimedOut) "Audio Cleanup Timed Out (Capture Locked)"
+                else getString(R.string.notification_title)
+            )
             .setContentText(
-                if (activeMode == AudioCastMode.WEBRTC) {
-                    "WebRTC playback capture active; internal microphone recorder in use"
-                } else {
-                    getString(R.string.notification_text)
+                when {
+                    isCleanupTimedOut -> timeoutMessage
+                        ?: "Native audio cleanup did not finish; restart the app before capturing again."
+                    activeMode == AudioCastMode.WEBRTC ->
+                        "WebRTC playback capture active; internal microphone recorder in use"
+                    else -> getString(R.string.notification_text)
                 }
             )
             .setContentIntent(pendingOpen)
             .setOngoing(true)
-            .addAction(
+
+        if (!isCleanupTimedOut) {
+            val stopIntent = Intent(this, AudioCastCaptureService::class.java).apply {
+                action = ACTION_STOP_AUDIO_CAST
+            }
+            val pendingStop = PendingIntent.getService(
+                this,
+                1,
+                stopIntent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            builder.addAction(
                 android.R.drawable.ic_media_pause,
                 getString(R.string.btn_stop_casting),
                 pendingStop
             )
-            .build()
+        }
+        return builder.build()
     }
 
     companion object {

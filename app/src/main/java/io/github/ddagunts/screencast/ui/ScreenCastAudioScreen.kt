@@ -142,7 +142,9 @@ fun ScreenCastAudioScreen(
                 item {
                     CastModeSelector(
                         config = config,
-                        isRequestingCapture = isRequestingCapture,
+                        isRequestingCapture = isRequestingCapture ||
+                            telemetry.isCaptureLocked ||
+                            telemetry.webRtcStage == WebRtcStage.CLEANUP_TIMEOUT,
                         onModeChanged = onModeChanged
                     )
                 }
@@ -152,7 +154,10 @@ fun ScreenCastAudioScreen(
                         WebRtcConnectionCard(
                             castStatus = castStatus,
                             castButton = castButton,
-                            canDisconnect = !telemetry.isSessionActive && !isRequestingCapture,
+                            canDisconnect = !telemetry.isSessionActive &&
+                                !isRequestingCapture &&
+                                !telemetry.isCaptureLocked &&
+                                telemetry.webRtcStage != WebRtcStage.CLEANUP_TIMEOUT,
                             onDisconnect = onStopCastClicked
                         )
                     }
@@ -374,6 +379,7 @@ private fun HeroHeaderCard(
                             WebRtcStage.CONNECTED -> "WebRTC connected. Waiting for audio send statistics."
                             WebRtcStage.SENDING -> "Sending audio. Confirm audible playback on the speaker."
                             WebRtcStage.STOPPING -> "Stopping capture and the Cast session..."
+                            WebRtcStage.CLEANUP_TIMEOUT -> "Native audio cleanup timed out. Capture is disabled in this process until the app is restarted."
                             WebRtcStage.ERROR -> "Audio capture stopped with an error."
                         }
                     } else {
@@ -396,9 +402,11 @@ private fun HeroHeaderCard(
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     if (!telemetry.isSessionActive) {
+                        val isCaptureLocked = telemetry.isCaptureLocked ||
+                            telemetry.webRtcStage == WebRtcStage.CLEANUP_TIMEOUT
                         Button(
                             onClick = onStartCastClicked,
-                            enabled = !isRequestingCapture && (config.mode == AudioCastMode.AAC ||
+                            enabled = !isRequestingCapture && !isCaptureLocked && (config.mode == AudioCastMode.AAC ||
                                 (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && castStatus.isConnected)),
                             modifier = Modifier
                                 .fillMaxWidth()

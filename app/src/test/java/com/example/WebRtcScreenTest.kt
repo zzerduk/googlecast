@@ -44,7 +44,25 @@ class WebRtcScreenTest {
         compose.onNodeWithTag("start_cast_button").assertDoesNotExist()
     }
 
-    private fun showScreen(telemetry: AudioPipelineTelemetry = AudioPipelineTelemetry()) {
+    @Test
+    fun cleanupTimeoutDisablesStartButtonAndShowsTimeoutError() {
+        showScreen(
+            telemetry = AudioPipelineTelemetry(
+                isSessionActive = false,
+                webRtcStage = WebRtcStage.CLEANUP_TIMEOUT,
+                isCaptureLocked = true,
+                error = "WebRTC native audio cleanup timed out after 3000 ms"
+            ),
+            castStatus = CastSdkSessionStatus(isAvailable = true, isConnected = true, deviceName = "Living Room")
+        )
+        compose.onNodeWithTag("start_cast_button").assertIsNotEnabled()
+        compose.onNodeWithTag("capture_error_text").assertExists()
+    }
+
+    private fun showScreen(
+        telemetry: AudioPipelineTelemetry = AudioPipelineTelemetry(),
+        castStatus: CastSdkSessionStatus = CastSdkSessionStatus(isAvailable = true)
+    ) {
         compose.setContent {
             MyApplicationTheme {
                 ScreenCastAudioScreen(
@@ -55,7 +73,7 @@ class WebRtcScreenTest {
                     telemetry = telemetry,
                     adtsHeaderHex = "",
                     logs = emptyList(),
-                    castStatus = CastSdkSessionStatus(isAvailable = true),
+                    castStatus = castStatus,
                     isRequestingCapture = false,
                     onModeChanged = {},
                     castButton = { Text("Cast selector", Modifier.testTag("cast_selector_slot")) },

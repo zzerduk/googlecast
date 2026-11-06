@@ -1,8 +1,11 @@
 package io.github.ddagunts.screencast.ui
 
+import android.Manifest
 import android.app.Application
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.github.ddagunts.screencast.cast.CastDeviceDiscovery
@@ -16,6 +19,7 @@ import io.github.ddagunts.screencast.media.AudioCastSessionCoordinator
 import io.github.ddagunts.screencast.media.AudioCastMode
 import io.github.ddagunts.screencast.media.AudioPipelineTelemetry
 import io.github.ddagunts.screencast.media.AudioStreamConfig
+import io.github.ddagunts.screencast.webrtc.WebRtcStage
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -57,6 +61,13 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         if (config.value.mode == AudioCastMode.AAC) startMdnsDiscovery()
     }
 
+    private fun isCaptureLockedInProcess(): Boolean {
+        val current = telemetry.value
+        return AudioCastSessionCoordinator.isCaptureLocked ||
+            current.isCaptureLocked ||
+            current.webRtcStage == WebRtcStage.CLEANUP_TIMEOUT
+    }
+
     fun startMdnsDiscovery() {
         discovery.startDiscovery()
     }
@@ -66,12 +77,14 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun setCastMode(mode: AudioCastMode) {
+        if (isCaptureLockedInProcess()) return
         if (mode == config.value.mode || modeChangeJob?.isActive == true || _isRequestingCapture.value) return
         modeChangeJob = viewModelScope.launch {
             if (telemetry.value.isSessionActive) {
                 stopAudioCast()
                 telemetry.first { !it.isSessionActive }
             }
+            if (isCaptureLockedInProcess()) return@launch
             CastSdkSessionController.endSession()
             AudioCastSessionCoordinator.updateConfig { it.copy(mode = mode) }
             AudioCastSessionCoordinator.updateTelemetry { AudioPipelineTelemetry() }
@@ -87,6 +100,9 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun prepareCaptureRequest(): Boolean {
+        if (isCaptureLockedInProcess()) {
+            return false
+        }
         if (_isRequestingCapture.value || telemetry.value.isSessionActive || modeChangeJob?.isActive == true) {
             return false
         }
@@ -117,7 +133,9 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         requestedMode = null
         requestedChannel = null
         _isRequestingCapture.value = false
-        AudioCastSessionCoordinator.updateTelemetry { it.copy(error = message) }
+        if (!isCaptureLockedInProcess()) {
+            AudioCastSessionCoordinator.updateTelemetry { it.copy(error = message) }
+        }
         AudioCastSessionCoordinator.appendLog(message)
         if (mode == AudioCastMode.WEBRTC) channel?.endSession()
     }
@@ -175,6 +193,12 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun startAudioCastWithProjection(resultCode: Int, resultData: Intent?) {
+        if (isCaptureLockedInProcess()) {
+            requestedMode = null
+            requestedChannel = null
+            _isRequestingCapture.value = false
+            return
+        }
         val mode = requestedMode ?: run {
             captureAuthorizationFailed("Capture authorization request expired. Start again with fresh authorization.")
             return
@@ -190,18 +214,22 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
             captureAuthorizationFailed("The selected Cast session changed. Start again with fresh authorization.")
             return
         }
+        val app = getApplication<Application>()
+        if (ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            captureAuthorizationFailed("RECORD_AUDIO permission is required.")
+            return
+        }
         val channel = requestedChannel
         requestedMode = null
         requestedChannel = null
         _isRequestingCapture.value = false
-        val app = getApplication<Application>()
         val serviceIntent = Intent(app, AudioCastCaptureService::class.java).apply {
             action = AudioCastCaptureService.ACTION_START_AUDIO_CAST
             putExtra(AudioCastCaptureService.EXTRA_RESULT_CODE, resultCode)
             putExtra(AudioCastCaptureService.EXTRA_MODE, mode.name)
-            if (resultData != null) {
-                putExtra(AudioCastCaptureService.EXTRA_RESULT_DATA, resultData)
-            }
+            putExtra(AudioCastCaptureService.EXTRA_RESULT_DATA, resultData)
         }
         AudioCastSessionCoordinator.updateTelemetry {
             AudioPipelineTelemetry(isSessionActive = true)
@@ -223,6 +251,10 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         requestedMode = null
         requestedChannel = null
         _isRequestingCapture.value = false
+        if (isCaptureLockedInProcess()) {
+            CastSdkSessionController.endSession()
+            return
+        }
         if (!telemetry.value.isSessionActive) {
             CastSdkSessionController.endSession()
             AudioCastSessionCoordinator.updateTelemetry { AudioPipelineTelemetry() }

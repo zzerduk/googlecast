@@ -24,7 +24,7 @@ data class AudioStreamConfig(
         get() = if (sampleRateHz == 44100) 4 else 3 // 3 = 48000Hz, 4 = 44100Hz
 
     /**
-     * Each AAC-LC frame represents 1024 PCM samples per channel (~21.33ms at 48kHz, ~23.22ms at 44.1kHz).
+     * Each AAC-LC frame represents 1024 PCM samples per channel (~21.33ms at 48kHz, ~44.1kHz ~23.22ms).
      */
     val singleAacFrameDurationMs: Double
         get() = (1024.0 * 1000.0) / sampleRateHz.toDouble()
@@ -63,5 +63,6 @@ data class AudioPipelineTelemetry(
     val pcmUnderruns: Long = 0,
     val pcmDroppedChunks: Long = 0,
     val pcmRingDepth: Int = 0,
+    val isCaptureLocked: Boolean = false,
     val error: String? = null
 )

@@ -1,8 +1,10 @@
 package io.github.ddagunts.screencast.media
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
@@ -20,6 +22,25 @@ import kotlinx.coroutines.launch
 import kotlin.math.log10
 import kotlin.math.sqrt
 
+internal interface PlaybackCaptureRecorder {
+    val state: Int
+    val recordingState: Int
+    fun startRecording()
+    fun readNonBlocking(audioData: ByteArray, offsetInBytes: Int, sizeInBytes: Int): Int
+    fun stop()
+    fun release()
+}
+
+internal fun interface PlaybackCaptureRecorderFactory {
+    fun create(
+        projection: MediaProjection,
+        sampleRate: Int,
+        channelConfig: Int,
+        encoding: Int,
+        bufferSizeBytes: Int
+    ): PlaybackCaptureRecorder?
+}
+
 /**
  * Captures system playback audio via [AudioPlaybackCaptureConfiguration] and feeds
  * [AdtsAacEncoder] with zero-gap silent PCM injection when tracks switch or pause.
@@ -31,7 +52,8 @@ import kotlin.math.sqrt
  * 4. Implements the **Zero-Gap Track Switching (Silence Injector)** on a high-priority coroutine
  *    with a 15ms ticker so downstream ADTS AAC output maintains a continuous constant bit-rate clock.
  */
-class AudioPlaybackCaptureEngine(
+class AudioPlaybackCaptureEngine internal constructor(
+    private val context: Context? = null,
     private val configProvider: () -> AudioStreamConfig,
     private val onAdtsPacketEncoded: (ByteArray) -> Unit,
     private val onStatsUpdated: (
@@ -41,12 +63,39 @@ class AudioPlaybackCaptureEngine(
         rmsDb: Float,
         minBufferBytes: Int
     ) -> Unit,
-    private val onEngineLog: (String) -> Unit
+    private val onEngineLog: (String) -> Unit,
+    private val isEmulatorProvider: () -> Boolean = ::isEmulatorAudioHalEnvironment,
+    private val activePlaybackChecker: (Context?) -> Boolean = ::hasActiveMatchingSystemPlayback,
+    private val recorderFactory: PlaybackCaptureRecorderFactory = DefaultPlaybackCaptureRecorderFactory
 ) {
+    constructor(
+        configProvider: () -> AudioStreamConfig,
+        onAdtsPacketEncoded: (ByteArray) -> Unit,
+        onStatsUpdated: (
+            adtsFrames: Long,
+            silenceFrames: Long,
+            isSilentNow: Boolean,
+            rmsDb: Float,
+            minBufferBytes: Int
+        ) -> Unit,
+        onEngineLog: (String) -> Unit,
+        context: Context? = null
+    ) : this(
+        context = context,
+        configProvider = configProvider,
+        onAdtsPacketEncoded = onAdtsPacketEncoded,
+        onStatsUpdated = onStatsUpdated,
+        onEngineLog = onEngineLog,
+        isEmulatorProvider = ::isEmulatorAudioHalEnvironment,
+        activePlaybackChecker = ::hasActiveMatchingSystemPlayback,
+        recorderFactory = DefaultPlaybackCaptureRecorderFactory
+    )
+
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var captureJob: Job? = null
-    private var audioRecord: AudioRecord? = null
+    @Volatile private var audioRecord: PlaybackCaptureRecorder? = null
     private var aacEncoder: AdtsAacEncoder? = null
+    @Volatile private var playbackCaptureDisabledForSession: Boolean = false
 
     @Volatile
     var isVideoPipelineAllocated: Boolean = false
@@ -63,53 +112,37 @@ class AudioPlaybackCaptureEngine(
 
         // Phase 2.3: Explicitly verify zero video pipeline resources are allocated
         isVideoPipelineAllocated = false
+        playbackCaptureDisabledForSession = false
 
         val minBuf = AudioRecord.getMinBufferSize(sampleRate, channelConfig, encoding)
             .coerceAtLeast(BYTES_PER_AAC_PCM_FRAME)
         // Phase 2.4: Minimize internal AudioRecord buffer size to getMinBufferSize(...) * 2
         val targetBufferSizeBytes = minBuf * 2
 
-        var createdAudioRecord: AudioRecord? = null
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && mediaProjection != null) {
-            try {
-                val playbackConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
-                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                    .build()
+        val canUseHardwarePlaybackCapture = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            mediaProjection != null &&
+            !isEmulatorProvider()
 
-                val audioFormat = AudioFormat.Builder()
-                    .setEncoding(encoding)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(channelConfig)
-                    .build()
-
-                val record = AudioRecord.Builder()
-                    .setAudioPlaybackCaptureConfig(playbackConfig)
-                    .setAudioFormat(audioFormat)
-                    .setBufferSizeInBytes(targetBufferSizeBytes)
-                    .build()
-
-                if (record.state == AudioRecord.STATE_INITIALIZED) {
-                    record.startRecording()
-                    createdAudioRecord = record
-                    onEngineLog(
-                        "AudioPlaybackCapture initialized (${sampleRate}Hz Stereo PCM16, " +
-                            "buf=${targetBufferSizeBytes}B = 2x minBuf, VirtualDisplay: BYPASSED)"
-                    )
-                } else {
-                    record.release()
-                    onEngineLog("AudioRecord state uninitialized; activating continuous Silence Injector clock")
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "AudioPlaybackCapture setup notice: ${e.message}")
-                onEngineLog("AudioPlaybackCapture fallback to Silence Injector clock (${e.message})")
-            }
+        if (!canUseHardwarePlaybackCapture) {
+            playbackCaptureDisabledForSession = true
+            onEngineLog(
+                "Continuous ADTS Silence Injector clock active (${sampleRate}Hz, " +
+                    "${config.bitrateBps / 1000}kbps CBR; virtual r_submix HAL bypassed)"
+            )
+        } else if (activePlaybackChecker(context)) {
+            audioRecord = tryCreateAndStartRecorder(
+                projection = mediaProjection,
+                sampleRate = sampleRate,
+                channelConfig = channelConfig,
+                encoding = encoding,
+                targetBufferSizeBytes = targetBufferSizeBytes
+            )
         } else {
-            onEngineLog("Continuous ADTS Silence Injector clock started (${sampleRate}Hz, ${config.bitrateBps / 1000}kbps CBR)")
+            onEngineLog(
+                "No active system media playback detected yet; Silence Injector clock active " +
+                    "until media playback starts (${sampleRate}Hz, ${config.bitrateBps / 1000}kbps CBR)"
+            )
         }
-
-        audioRecord = createdAudioRecord
 
         var emittedFramesCount = 0L
         val encoder = AdtsAacEncoder(
@@ -136,21 +169,63 @@ class AudioPlaybackCaptureEngine(
 
             var silenceChunksInjected = 0L
             var totalSamplesPresented = 0L
+            var ticksSincePlaybackCheck = 0
+            var consecutiveEmptyReads = 0
             val tickerMs = config.silenceInjectorTickerMs.coerceIn(10L, 20L)
 
             while (isActive) {
+                if (canUseHardwarePlaybackCapture && !playbackCaptureDisabledForSession && mediaProjection != null) {
+                    ticksSincePlaybackCheck++
+                    if (audioRecord == null && ticksSincePlaybackCheck >= 25) {
+                        ticksSincePlaybackCheck = 0
+                        if (activePlaybackChecker(context)) {
+                            audioRecord = tryCreateAndStartRecorder(
+                                projection = mediaProjection,
+                                sampleRate = sampleRate,
+                                channelConfig = channelConfig,
+                                encoding = encoding,
+                                targetBufferSizeBytes = targetBufferSizeBytes
+                            )
+                            consecutiveEmptyReads = 0
+                        }
+                    }
+                }
+
                 val activeRecord = audioRecord
                 val bytesRead = if (activeRecord != null &&
                     activeRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING
                 ) {
-                    activeRecord.read(
-                        pcmBuffer,
-                        0,
-                        BYTES_PER_AAC_PCM_FRAME,
-                        AudioRecord.READ_NON_BLOCKING
-                    )
+                    try {
+                        activeRecord.readNonBlocking(
+                            pcmBuffer,
+                            0,
+                            BYTES_PER_AAC_PCM_FRAME
+                        )
+                    } catch (e: Exception) {
+                        Log.w(TAG, "AudioRecord read exception: ${e.message}")
+                        AudioRecord.ERROR_BAD_VALUE
+                    }
                 } else {
                     0
+                }
+
+                if (bytesRead < 0) {
+                    // Immediately retire the broken AudioRecord so native restoreRecord_l / createRecord_l(-22)
+                    // is never re-invoked on subsequent loop ticks.
+                    playbackCaptureDisabledForSession = true
+                    retireActiveRecorder(
+                        "AudioPlaybackCapture read returned status $bytesRead; switching permanently to Silence Injector clock"
+                    )
+                } else if (activeRecord != null && bytesRead == 0) {
+                    consecutiveEmptyReads++
+                    if (consecutiveEmptyReads >= 20 && !activePlaybackChecker(context)) {
+                        consecutiveEmptyReads = 0
+                        retireActiveRecorder(
+                            "System media playback idle; pausing AudioRecord while Silence Injector maintains CBR clock"
+                        )
+                    }
+                } else if (bytesRead > 0) {
+                    consecutiveEmptyReads = 0
                 }
 
                 val ptsUs = (totalSamplesPresented * 1_000_000L) / sampleRate.toLong()
@@ -186,6 +261,66 @@ class AudioPlaybackCaptureEngine(
                 delay(tickerMs)
             }
         }
+    }
+
+    private fun tryCreateAndStartRecorder(
+        projection: MediaProjection,
+        sampleRate: Int,
+        channelConfig: Int,
+        encoding: Int,
+        targetBufferSizeBytes: Int
+    ): PlaybackCaptureRecorder? {
+        return try {
+            val record = recorderFactory.create(
+                projection = projection,
+                sampleRate = sampleRate,
+                channelConfig = channelConfig,
+                encoding = encoding,
+                bufferSizeBytes = targetBufferSizeBytes
+            ) ?: return null
+
+            if (record.state == AudioRecord.STATE_INITIALIZED) {
+                record.startRecording()
+                if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                    onEngineLog(
+                        "AudioPlaybackCapture initialized (${sampleRate}Hz Stereo PCM16, " +
+                            "buf=${targetBufferSizeBytes}B = 2x minBuf, VirtualDisplay: BYPASSED)"
+                    )
+                    record
+                } else {
+                    runCatching { record.release() }
+                    playbackCaptureDisabledForSession = true
+                    onEngineLog("AudioRecord did not enter recording state; activating continuous Silence Injector clock")
+                    null
+                }
+            } else {
+                runCatching { record.release() }
+                playbackCaptureDisabledForSession = true
+                onEngineLog("AudioRecord state uninitialized; activating continuous Silence Injector clock")
+                null
+            }
+        } catch (e: Exception) {
+            playbackCaptureDisabledForSession = true
+            Log.w(TAG, "AudioPlaybackCapture setup notice: ${e.message}")
+            onEngineLog("AudioPlaybackCapture fallback to Silence Injector clock (${e.message})")
+            null
+        }
+    }
+
+    private fun retireActiveRecorder(reason: String) {
+        val record = audioRecord ?: return
+        audioRecord = null
+        try {
+            if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                record.stop()
+            }
+        } catch (_: Exception) {
+        }
+        try {
+            record.release()
+        } catch (_: Exception) {
+        }
+        onEngineLog(reason)
     }
 
     fun stopCapture() {
@@ -244,5 +379,116 @@ class AudioPlaybackCaptureEngine(
         private const val TAG = "AudioPlaybackCapture"
         const val SAMPLES_PER_AAC_FRAME = 1024
         const val BYTES_PER_AAC_PCM_FRAME = SAMPLES_PER_AAC_FRAME * 2 * 2 // 1024 samples * stereo * 16-bit = 4096 bytes
+
+        internal fun isEmulatorAudioHalEnvironment(): Boolean {
+            val fingerprint = Build.FINGERPRINT.orEmpty()
+            val hardware = Build.HARDWARE.orEmpty()
+            val model = Build.MODEL.orEmpty()
+            val product = Build.PRODUCT.orEmpty()
+            val board = Build.BOARD.orEmpty()
+            val brand = Build.BRAND.orEmpty()
+            val device = Build.DEVICE.orEmpty()
+            return fingerprint.startsWith("generic", ignoreCase = true) ||
+                fingerprint.contains("emulator", ignoreCase = true) ||
+                fingerprint.contains("sdk_gphone", ignoreCase = true) ||
+                hardware.contains("goldfish", ignoreCase = true) ||
+                hardware.contains("ranchu", ignoreCase = true) ||
+                hardware.contains("cuttlefish", ignoreCase = true) ||
+                hardware.contains("vsoc", ignoreCase = true) ||
+                model.contains("google_sdk", ignoreCase = true) ||
+                model.contains("Emulator", ignoreCase = true) ||
+                model.contains("Android SDK built for", ignoreCase = true) ||
+                model.contains("sdk_gphone", ignoreCase = true) ||
+                model.contains("Cuttlefish", ignoreCase = true) ||
+                product.contains("sdk", ignoreCase = true) ||
+                product.contains("emulator", ignoreCase = true) ||
+                product.contains("simulator", ignoreCase = true) ||
+                product.contains("cf_", ignoreCase = true) ||
+                product.contains("aosp_cf_", ignoreCase = true) ||
+                board.contains("goldfish", ignoreCase = true) ||
+                board.contains("ranchu", ignoreCase = true) ||
+                board.contains("cuttlefish", ignoreCase = true) ||
+                device.contains("vsoc", ignoreCase = true) ||
+                device.contains("emu", ignoreCase = true) ||
+                (brand.startsWith("generic", ignoreCase = true) && device.startsWith("generic", ignoreCase = true))
+        }
+
+        internal fun hasActiveMatchingSystemPlayback(context: Context?): Boolean {
+            if (context == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
+            return try {
+                val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                    ?: return false
+                audioManager.activePlaybackConfigurations.any { cfg ->
+                    val usage = cfg.audioAttributes?.usage
+                    usage == AudioAttributes.USAGE_MEDIA ||
+                        usage == AudioAttributes.USAGE_GAME ||
+                        usage == AudioAttributes.USAGE_UNKNOWN
+                }
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
+}
+
+private object DefaultPlaybackCaptureRecorderFactory : PlaybackCaptureRecorderFactory {
+    @SuppressLint("MissingPermission")
+    override fun create(
+        projection: MediaProjection,
+        sampleRate: Int,
+        channelConfig: Int,
+        encoding: Int,
+        bufferSizeBytes: Int
+    ): PlaybackCaptureRecorder? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+        val playbackConfig = AudioPlaybackCaptureConfiguration.Builder(projection)
+            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+            .addMatchingUsage(AudioAttributes.USAGE_GAME)
+            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+            .build()
+
+        val audioFormat = AudioFormat.Builder()
+            .setEncoding(encoding)
+            .setSampleRate(sampleRate)
+            .setChannelMask(channelConfig)
+            .build()
+
+        val record = AudioRecord.Builder()
+            .setAudioPlaybackCaptureConfig(playbackConfig)
+            .setAudioFormat(audioFormat)
+            .setBufferSizeInBytes(bufferSizeBytes)
+            .build()
+
+        return object : PlaybackCaptureRecorder {
+            override val state: Int
+                get() = record.state
+            override val recordingState: Int
+                get() = record.recordingState
+
+            override fun startRecording() {
+                record.startRecording()
+            }
+
+            override fun readNonBlocking(
+                audioData: ByteArray,
+                offsetInBytes: Int,
+                sizeInBytes: Int
+            ): Int {
+                return record.read(
+                    audioData,
+                    offsetInBytes,
+                    sizeInBytes,
+                    AudioRecord.READ_NON_BLOCKING
+                )
+            }
+
+            override fun stop() {
+                record.stop()
+            }
+
+            override fun release() {
+                record.release()
+            }
+        }
     }
 }

@@ -62,6 +62,10 @@ class MainActivity : FragmentActivity() {
                             } catch (e: CancellationException) {
                                 viewModel.captureAuthorizationFailed("Capture authorization was interrupted. Start again.")
                                 throw e
+                            } catch (e: Exception) {
+                                viewModel.captureAuthorizationFailed(
+                                    e.message ?: "Unable to start audio capture after authorization."
+                                )
                             }
                         }
                     } else {
@@ -81,11 +85,12 @@ class MainActivity : FragmentActivity() {
 
                 val permissionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestMultiplePermissions()
-                ) {
-                    if (ContextCompat.checkSelfPermission(
+                ) { grantResults ->
+                    val recordAudioGranted = grantResults[Manifest.permission.RECORD_AUDIO] == true ||
+                        ContextCompat.checkSelfPermission(
                             this@MainActivity, Manifest.permission.RECORD_AUDIO
                         ) == PackageManager.PERMISSION_GRANTED
-                    ) {
+                    if (recordAudioGranted) {
                         requestProjectionConsent()
                     } else {
                         viewModel.captureAuthorizationFailed("RECORD_AUDIO permission was denied.")
@@ -113,7 +118,9 @@ class MainActivity : FragmentActivity() {
                                     }
                                 },
                                 update = { button ->
-                                    button.isEnabled = !isRequestingCapture && !telemetry.isSessionActive
+                                    button.isEnabled = !isRequestingCapture &&
+                                        !telemetry.isSessionActive &&
+                                        !telemetry.isCaptureLocked
                                 },
                                 modifier = Modifier.size(48.dp).testTag("official_cast_button")
                             )
@@ -147,7 +154,13 @@ class MainActivity : FragmentActivity() {
                             }
 
                             if (missingPermissions.isNotEmpty()) {
-                                permissionLauncher.launch(missingPermissions.toTypedArray())
+                                try {
+                                    permissionLauncher.launch(missingPermissions.toTypedArray())
+                                } catch (e: Exception) {
+                                    viewModel.captureAuthorizationFailed(
+                                        e.message ?: "Unable to request required audio permissions."
+                                    )
+                                }
                             } else {
                                 requestProjectionConsent()
                             }

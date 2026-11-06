@@ -1,14 +1,12 @@
 package io.github.ddagunts.screencast.media
 
-/**
- * Configuration for the Ultra-Low-Latency Audio-Only Caster pipeline.
- *
- * Phase 5 defaults:
- * - [isAudioOnlyLowLatencyMode] defaults to `true`.
- * - [preBurstBufferMs] defaults to `300` ms (adjustable `0..1000` ms).
- * - [sampleRateHz] defaults to `48000` Hz (`48000` or `44100` Hz).
- * - [bitrateBps] defaults to `192000` bps (`192000` or `128000` bps CBR).
- */
+import io.github.ddagunts.screencast.webrtc.WebRtcStage
+
+enum class AudioCastMode {
+    WEBRTC, AAC
+}
+
+// AAC tuning is retained independently of WebRTC's fixed PCM format.
 data class AudioStreamConfig(
     val isAudioOnlyLowLatencyMode: Boolean = true,
     val sampleRateHz: Int = 48000,
@@ -19,7 +17,8 @@ data class AudioStreamConfig(
     val legacyVideoResolution: String = "1280x720 (Disabled — Headless Speaker)",
     val legacyH264BitrateKbps: Int = 0,
     val legacyHlsSegmentDurationSec: Int = 0,
-    val legacyHlsPlaylistWindow: Int = 0
+    val legacyHlsPlaylistWindow: Int = 0,
+    val mode: AudioCastMode = AudioCastMode.WEBRTC
 ) {
     val sampleRateIndex: Int
         get() = if (sampleRateHz == 44100) 4 else 3 // 3 = 48000Hz, 4 = 44100Hz
@@ -55,5 +54,14 @@ data class AudioPipelineTelemetry(
     val preBurstFramesFlushedLastClient: Int = 0,
     val currentRmsDb: Float = -60f,
     val audioRecordMinBufferBytes: Int = 0,
-    val videoPipelineAllocated: Boolean = false
+    val videoPipelineAllocated: Boolean = false,
+    val isSessionActive: Boolean = false,
+    val webRtcStage: WebRtcStage = WebRtcStage.IDLE,
+    val audioPacketsSent: Long = 0,
+    val rttMs: Double? = null,
+    val pcmChunksRead: Long = 0,
+    val pcmUnderruns: Long = 0,
+    val pcmDroppedChunks: Long = 0,
+    val pcmRingDepth: Int = 0,
+    val error: String? = null
 )

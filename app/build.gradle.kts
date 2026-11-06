@@ -130,6 +130,8 @@ dependencies {
   implementation(libs.kotlinx.coroutines.core)
   implementation(libs.ktor.server.core)
   implementation(libs.ktor.server.cio)
+  implementation(libs.play.services.cast.framework)
+  implementation(libs.webrtc.sdk.android)
   // implementation(libs.logging.interceptor)
   // implementation(libs.moshi.kotlin)
   // implementation(libs.okhttp)

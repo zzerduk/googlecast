@@ -41,11 +41,15 @@ googleServices = "4.5.0"
 credentials = "1.5.0"
 googleid = "1.1.1"
 ktor = "2.3.12"
+castFramework = "22.3.1"
+webrtcSdk = "125.6422.07"
 
 
 [libraries]
 ktor-server-core = { group = "io.ktor", name = "ktor-server-core-jvm", version.ref = "ktor" }
 ktor-server-cio = { group = "io.ktor", name = "ktor-server-cio-jvm", version.ref = "ktor" }
+play-services-cast-framework = { group = "com.google.android.gms", name = "play-services-cast-framework", version.ref = "castFramework" }
+webrtc-sdk-android = { group = "io.github.webrtc-sdk", name = "android", version.ref = "webrtcSdk" }
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }

@@ -1,5 +1,6 @@
 package io.github.ddagunts.screencast.ui
 
+import android.os.Build
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -76,8 +77,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
 import io.github.ddagunts.screencast.cast.CastDeviceModel
+import io.github.ddagunts.screencast.cast.CastSdkSessionStatus
+import io.github.ddagunts.screencast.media.AudioCastMode
 import io.github.ddagunts.screencast.media.AudioPipelineTelemetry
 import io.github.ddagunts.screencast.media.AudioStreamConfig
+import io.github.ddagunts.screencast.webrtc.WebRtcStage
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -90,6 +94,10 @@ fun ScreenCastAudioScreen(
     telemetry: AudioPipelineTelemetry,
     adtsHeaderHex: String,
     logs: List<String>,
+    castStatus: CastSdkSessionStatus,
+    isRequestingCapture: Boolean,
+    onModeChanged: (AudioCastMode) -> Unit,
+    castButton: @Composable () -> Unit,
     onScanClicked: () -> Unit,
     onSelectDevice: (CastDeviceModel) -> Unit,
     onAddManualSpeaker: (name: String, host: String, port: Int, model: String, ca: Int) -> Unit,
@@ -124,37 +132,53 @@ fun ScreenCastAudioScreen(
                     HeroHeaderCard(
                         telemetry = telemetry,
                         config = config,
+                        castStatus = castStatus,
+                        isRequestingCapture = isRequestingCapture,
                         onStartCastClicked = onStartCastClicked,
                         onStopCastClicked = onStopCastClicked
                     )
                 }
 
                 item {
-                    AudioModeCard(
+                    CastModeSelector(
                         config = config,
-                        onToggleAudioOnlyMode = onToggleAudioOnlyMode
+                        isRequestingCapture = isRequestingCapture,
+                        onModeChanged = onModeChanged
                     )
                 }
 
-                item {
-                    CastDevicesSection(
-                        devices = devices,
-                        selectedDeviceId = selectedDeviceId,
-                        isScanning = isScanning,
-                        onScanClicked = onScanClicked,
-                        onSelectDevice = onSelectDevice,
-                        onOpenManualDialog = { showAddSpeakerDialog = true }
-                    )
-                }
-
-                item {
-                    StreamTuningCard(
-                        config = config,
-                        adtsHeaderHex = adtsHeaderHex,
-                        onPreBurstChanged = onPreBurstChanged,
-                        onSampleRateChanged = onSampleRateChanged,
-                        onBitrateChanged = onBitrateChanged
-                    )
+                if (config.mode == AudioCastMode.WEBRTC) {
+                    item {
+                        WebRtcConnectionCard(
+                            castStatus = castStatus,
+                            castButton = castButton,
+                            canDisconnect = !telemetry.isSessionActive && !isRequestingCapture,
+                            onDisconnect = onStopCastClicked
+                        )
+                    }
+                } else {
+                    item {
+                        AudioModeCard(config, onToggleAudioOnlyMode)
+                    }
+                    item {
+                        CastDevicesSection(
+                            devices = devices,
+                            selectedDeviceId = selectedDeviceId,
+                            isScanning = isScanning,
+                            onScanClicked = onScanClicked,
+                            onSelectDevice = onSelectDevice,
+                            onOpenManualDialog = { showAddSpeakerDialog = true }
+                        )
+                    }
+                    item {
+                        StreamTuningCard(
+                            config = config,
+                            adtsHeaderHex = adtsHeaderHex,
+                            onPreBurstChanged = onPreBurstChanged,
+                            onSampleRateChanged = onSampleRateChanged,
+                            onBitrateChanged = onBitrateChanged
+                        )
+                    }
                 }
 
                 item {
@@ -168,7 +192,7 @@ fun ScreenCastAudioScreen(
         }
     }
 
-    if (showAddSpeakerDialog) {
+    if (showAddSpeakerDialog && config.mode == AudioCastMode.AAC) {
         AddManualGoogleHomeDialog(
             onDismiss = { showAddSpeakerDialog = false },
             onConfirm = { name, host, port, model, ca ->
@@ -180,9 +204,92 @@ fun ScreenCastAudioScreen(
 }
 
 @Composable
+private fun CastModeSelector(
+    config: AudioStreamConfig,
+    isRequestingCapture: Boolean,
+    onModeChanged: (AudioCastMode) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth().testTag("cast_mode_selector"),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Audio transport", style = MaterialTheme.typography.titleMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                AudioCastMode.entries.forEach { mode ->
+                    FilterChip(
+                        selected = config.mode == mode,
+                        onClick = { onModeChanged(mode) },
+                        enabled = !isRequestingCapture,
+                        label = { Text(if (mode == AudioCastMode.WEBRTC) "WebRTC" else "AAC / HTTP") },
+                        modifier = Modifier.testTag("cast_mode_${mode.name}")
+                    )
+                }
+            }
+            Text(
+                "Changing transport stops the current session.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+private fun WebRtcConnectionCard(
+    castStatus: CastSdkSessionStatus,
+    castButton: @Composable () -> Unit,
+    canDisconnect: Boolean,
+    onDisconnect: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth().testTag("webrtc_connection_card"),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text("WebRTC system audio", style = MaterialTheme.typography.titleMedium)
+                castButton()
+            }
+            Text(
+                when {
+                    Build.VERSION.SDK_INT < Build.VERSION_CODES.Q -> "Requires Android 10 or later."
+                    castStatus.error != null -> castStatus.error
+                    castStatus.isConnecting -> "Connecting to ${castStatus.deviceName}..."
+                    castStatus.isConnected -> "Receiver connected: ${castStatus.deviceName}"
+                    castStatus.isAvailable -> "Choose a speaker using the Cast button, then start audio."
+                    else -> "Initializing Google Cast SDK..."
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (castStatus.error != null) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text("48 kHz / stereo / PCM16. Receiver: 9098830C", style = MaterialTheme.typography.bodySmall)
+            Text(
+                "This mode starts an internal microphone recorder. Its buffers are overwritten " +
+                    "with captured system audio or zeros; it does not bypass microphone access.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (castStatus.isConnected && canDisconnect) {
+                OutlinedButton(onClick = onDisconnect, modifier = Modifier.testTag("disconnect_cast_button")) {
+                    Text("Disconnect receiver")
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun HeroHeaderCard(
     telemetry: AudioPipelineTelemetry,
     config: AudioStreamConfig,
+    castStatus: CastSdkSessionStatus,
+    isRequestingCapture: Boolean,
     onStartCastClicked: () -> Unit,
     onStopCastClicked: () -> Unit
 ) {
@@ -234,7 +341,9 @@ private fun HeroHeaderCard(
                                 )
                         )
                         Text(
-                            text = if (telemetry.isStreaming) {
+                            text = if (config.mode == AudioCastMode.WEBRTC) {
+                                "WEBRTC / ${telemetry.webRtcStage.name}"
+                            } else if (telemetry.isStreaming) {
                                 "LIVE ADTS STREAM • ~${config.estimatedEndToEndLatencyMs}ms"
                             } else {
                                 "RECEIVER: CC1AD845 • ZERO-COST"
@@ -256,18 +365,41 @@ private fun HeroHeaderCard(
                     color = MaterialTheme.colorScheme.onSurface
                 )
                 Text(
-                    text = stringResource(R.string.hero_subtitle),
+                    text = if (config.mode == AudioCastMode.WEBRTC) {
+                        when (telemetry.webRtcStage) {
+                            WebRtcStage.IDLE -> if (castStatus.isConnected) "Receiver ready. Audio has not started."
+                                else "Connect your speaker with the official Cast button."
+                            WebRtcStage.CAPTURING -> "Starting authorized system audio capture..."
+                            WebRtcStage.NEGOTIATING -> "Negotiating WebRTC audio..."
+                            WebRtcStage.CONNECTED -> "WebRTC connected. Waiting for audio send statistics."
+                            WebRtcStage.SENDING -> "Sending audio. Confirm audible playback on the speaker."
+                            WebRtcStage.STOPPING -> "Stopping capture and the Cast session..."
+                            WebRtcStage.ERROR -> "Audio capture stopped with an error."
+                        }
+                    } else {
+                        stringResource(R.string.hero_subtitle)
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                telemetry.error?.let { error ->
+                    Text(
+                        text = error,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.testTag("capture_error_text")
+                    )
+                }
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    if (!telemetry.isStreaming) {
+                    if (!telemetry.isSessionActive) {
                         Button(
                             onClick = onStartCastClicked,
+                            enabled = !isRequestingCapture && (config.mode == AudioCastMode.AAC ||
+                                (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && castStatus.isConnected)),
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(52.dp)
@@ -284,7 +416,8 @@ private fun HeroHeaderCard(
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = stringResource(R.string.btn_start_casting),
+                                text = if (isRequestingCapture) "Waiting for capture authorization..."
+                                    else stringResource(R.string.btn_start_casting),
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold
                             )
@@ -779,7 +912,7 @@ private fun LiveTelemetryCard(
                 )
             }
 
-            if (telemetry.streamUrl.isNotBlank()) {
+            if (config.mode == AudioCastMode.AAC && telemetry.streamUrl.isNotBlank()) {
                 Surface(
                     shape = RoundedCornerShape(10.dp),
                     color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
@@ -801,7 +934,6 @@ private fun LiveTelemetryCard(
                 }
             }
 
-            // Signal / Silence Injector status bar
             val normalizedLevel = ((telemetry.currentRmsDb + 60f) / 60f).coerceIn(0.05f, 1f)
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Row(
@@ -809,12 +941,16 @@ private fun LiveTelemetryCard(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = stringResource(R.string.silence_injector_label),
+                        text = if (config.mode == AudioCastMode.WEBRTC) "System PCM level"
+                            else stringResource(R.string.silence_injector_label),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Text(
-                        text = if (telemetry.isStreaming) {
+                        text = if (config.mode == AudioCastMode.WEBRTC) {
+                            if (telemetry.pcmChunksRead > 0) "${telemetry.currentRmsDb.roundToInt()} dBFS"
+                                else "Waiting for captured PCM"
+                        } else if (telemetry.isStreaming) {
                             if (telemetry.isInjectingSilenceNow) {
                                 "INJECTING ZERO-PCM SILENCE (TRACK GAP GUARD)"
                             } else {
@@ -832,7 +968,7 @@ private fun LiveTelemetryCard(
                     )
                 }
                 LinearProgressIndicator(
-                    progress = { if (telemetry.isStreaming) normalizedLevel else 0f },
+                    progress = { if (telemetry.isSessionActive) normalizedLevel else 0f },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(6.dp)
@@ -840,26 +976,30 @@ private fun LiveTelemetryCard(
                 )
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                TelemetryMetricItem(
-                    label = "ADTS Frames",
-                    value = telemetry.adtsFramesEmitted.toString()
+            if (config.mode == AudioCastMode.WEBRTC) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    TelemetryMetricItem("Audio bytes", telemetry.totalBytesStreamed.toString())
+                    TelemetryMetricItem("Audio packets", telemetry.audioPacketsSent.toString())
+                    TelemetryMetricItem("ICE RTT", telemetry.rttMs?.let { "${it.roundToInt()} ms" } ?: "Unknown")
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    TelemetryMetricItem("PCM chunks", telemetry.pcmChunksRead.toString())
+                    TelemetryMetricItem("Underruns", telemetry.pcmUnderruns.toString())
+                    TelemetryMetricItem("Dropped chunks", telemetry.pcmDroppedChunks.toString())
+                    TelemetryMetricItem("Queued", telemetry.pcmRingDepth.toString())
+                }
+                Text(
+                    "RTT is not end-to-end audio latency. Sending statistics do not confirm audible playback.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                TelemetryMetricItem(
-                    label = "Silence Frames",
-                    value = telemetry.silenceFramesInjected.toString()
-                )
-                TelemetryMetricItem(
-                    label = "Video Alloc",
-                    value = if (telemetry.videoPipelineAllocated) "ACTIVE" else "0 (STRIPPED)"
-                )
-                TelemetryMetricItem(
-                    label = "Clients",
-                    value = telemetry.connectedSpeakerClients.toString()
-                )
+            } else {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    TelemetryMetricItem("ADTS Frames", telemetry.adtsFramesEmitted.toString())
+                    TelemetryMetricItem("Silence Frames", telemetry.silenceFramesInjected.toString())
+                    TelemetryMetricItem("Video Alloc", if (telemetry.videoPipelineAllocated) "ACTIVE" else "0 (STRIPPED)")
+                    TelemetryMetricItem("Clients", telemetry.connectedSpeakerClients.toString())
+                }
             }
 
             Surface(
@@ -874,7 +1014,8 @@ private fun LiveTelemetryCard(
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     Text(
-                        text = "Cast V2 (8009 TLS) & Ktor ADTS Log",
+                        text = if (config.mode == AudioCastMode.WEBRTC) "Cast SDK / WebRTC Log"
+                            else "Cast V2 (8009 TLS) & Ktor ADTS Log",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.secondary
                     )

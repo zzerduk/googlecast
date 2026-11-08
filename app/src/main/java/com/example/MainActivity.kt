@@ -12,11 +12,11 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
-import androidx.compose.foundation.layout.size
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
@@ -24,8 +24,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.withResumed
 import androidx.mediarouter.app.MediaRouteButton
-import com.google.android.gms.cast.framework.CastButtonFactory
 import com.example.ui.theme.MyApplicationTheme
+import com.google.android.gms.cast.framework.CastButtonFactory
 import io.github.ddagunts.screencast.ui.ScreenCastAudioScreen
 import io.github.ddagunts.screencast.ui.ScreenCastViewModel
 import kotlinx.coroutines.CancellationException
@@ -41,14 +41,19 @@ class MainActivity : FragmentActivity() {
 
         setContent {
             MyApplicationTheme {
-                val devices by viewModel.devices.collectAsStateWithLifecycle()
-                val selectedDeviceId by viewModel.selectedDeviceId.collectAsStateWithLifecycle()
-                val isScanning by viewModel.isScanning.collectAsStateWithLifecycle()
                 val config by viewModel.config.collectAsStateWithLifecycle()
                 val telemetry by viewModel.telemetry.collectAsStateWithLifecycle()
                 val logs by viewModel.combinedLogs.collectAsStateWithLifecycle()
                 val castStatus by viewModel.castStatus.collectAsStateWithLifecycle()
                 val isRequestingCapture by viewModel.isRequestingCapture.collectAsStateWithLifecycle()
+
+                val catalogApps by viewModel.catalogApps.collectAsStateWithLifecycle()
+                val searchableApps by viewModel.searchableApps.collectAsStateWithLifecycle()
+                val profiles by viewModel.profiles.collectAsStateWithLifecycle()
+                val selectedTargets by viewModel.selectedTargets.collectAsStateWithLifecycle()
+                val importedTargets by viewModel.importedTargets.collectAsStateWithLifecycle()
+                val muteTelemetry by viewModel.muteTelemetry.collectAsStateWithLifecycle()
+                val isTargetEditingLocked by viewModel.isTargetEditingLocked.collectAsStateWithLifecycle()
 
                 val mediaProjectionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.StartActivityForResult()
@@ -98,16 +103,11 @@ class MainActivity : FragmentActivity() {
                 }
 
                 ScreenCastAudioScreen(
-                    devices = devices,
-                    selectedDeviceId = selectedDeviceId,
-                    isScanning = isScanning,
                     config = config,
                     telemetry = telemetry,
-                    adtsHeaderHex = viewModel.previewAdtsHeaderHex(),
                     logs = logs,
                     castStatus = castStatus,
                     isRequestingCapture = isRequestingCapture,
-                    onModeChanged = viewModel::setCastMode,
                     castButton = {
                         if (castStatus.isAvailable && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                             AndroidView(
@@ -126,15 +126,6 @@ class MainActivity : FragmentActivity() {
                             )
                         }
                     },
-                    onScanClicked = { viewModel.startMdnsDiscovery() },
-                    onSelectDevice = { viewModel.selectDevice(it) },
-                    onAddManualSpeaker = { name, host, port, model, ca ->
-                        viewModel.addManualGoogleHomeDevice(name, host, port, model, ca)
-                    },
-                    onToggleAudioOnlyMode = { viewModel.setAudioOnlyLowLatencyMode(it) },
-                    onPreBurstChanged = { viewModel.setPreBurstBufferMs(it) },
-                    onSampleRateChanged = { viewModel.setSampleRateHz(it) },
-                    onBitrateChanged = { viewModel.setBitrateBps(it) },
                     onStartCastClicked = {
                         if (viewModel.prepareCaptureRequest()) {
                             val missingPermissions = buildList {
@@ -166,9 +157,27 @@ class MainActivity : FragmentActivity() {
                             }
                         }
                     },
-                    onStopCastClicked = { viewModel.stopAudioCast() }
+                    onStopCastClicked = { viewModel.stopAudioCast() },
+                    catalogApps = catalogApps,
+                    searchableApps = searchableApps,
+                    profiles = profiles,
+                    selectedTargets = selectedTargets,
+                    importedTargets = importedTargets,
+                    muteTelemetry = muteTelemetry,
+                    isTargetEditingLocked = isTargetEditingLocked,
+                    onToggleTarget = viewModel::toggleTargetAppSelection,
+                    onClearTargets = viewModel::clearTargetAppSelections,
+                    onImportTargetApp = { pkg, serial -> viewModel.importTargetApp(pkg, serial) },
+                    onRemoveImportedTarget = viewModel::removeImportedTarget,
+                    onRequestShizukuPermission = viewModel::requestShizukuPermission,
+                    onRefreshCatalog = viewModel::refreshTargetCatalog
                 )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.refreshTargetCatalog()
     }
 }

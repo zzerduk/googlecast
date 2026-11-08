@@ -146,7 +146,7 @@ class WebRtcAudioSession internal constructor(
     internal val isCleanupWorkerAlive: Boolean
         get() = cleanupWorkerThread?.isAlive == true
 
-    suspend fun start(projection: MediaProjection) {
+    suspend fun start(projection: MediaProjection, targetUids: Set<Int> = emptySet()) {
         checkMainThread()
         check(!started && !logicalStopped) { "Create a new WebRtcAudioSession for each attempt" }
         check(channel.isConnected) { "No active custom Receiver session" }
@@ -166,7 +166,7 @@ class WebRtcAudioSession internal constructor(
         }
         try {
             onStage(WebRtcStage.CAPTURING)
-            initializeNativeOffMain(projection, epoch)
+            initializeNativeOffMain(projection, targetUids, epoch)
             if (closing || generation != epoch) {
                 throw CancellationException("WebRTC session stopped during initialization")
             }
@@ -212,7 +212,11 @@ class WebRtcAudioSession internal constructor(
         }
     }
 
-    private suspend fun initializeNativeOffMain(projection: MediaProjection, epoch: Long) {
+    private suspend fun initializeNativeOffMain(
+        projection: MediaProjection,
+        targetUids: Set<Int>,
+        epoch: Long
+    ) {
         val latch = CountDownLatch(1)
         initLatch = latch
         val capture = captureFactory(
@@ -226,7 +230,7 @@ class WebRtcAudioSession internal constructor(
         withContext(workerDispatcher) {
             try {
                 if (closing || generation != epoch) return@withContext
-                capture.attachProjection(projection)
+                capture.attachProjection(projection, targetUids)
                 if (closing || generation != epoch) return@withContext
                 backend.buildPeer(
                     context = context,

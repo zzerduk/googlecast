@@ -20,10 +20,10 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.example.MainActivity
 import com.example.R
-import io.github.ddagunts.screencast.cast.CastDeviceModel
 import io.github.ddagunts.screencast.cast.CastSdkSessionController
 import io.github.ddagunts.screencast.cast.CastSignalingChannel
-import io.github.ddagunts.screencast.cast.CastV2ChannelClient
+import io.github.ddagunts.screencast.shizuku.ShizukuSessionMuteController
+import io.github.ddagunts.screencast.target.CaptureTargetRepository
 import io.github.ddagunts.screencast.webrtc.WebRtcAudioSession
 import io.github.ddagunts.screencast.webrtc.WebRtcCleanupTimeoutException
 import io.github.ddagunts.screencast.webrtc.WebRtcStage
@@ -33,15 +33,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.net.Inet4Address
-import java.net.NetworkInterface
 
 object AudioCastSessionCoordinator {
     private val _config = MutableStateFlow(AudioStreamConfig())
@@ -52,15 +49,12 @@ object AudioCastSessionCoordinator {
 
     private val _protocolLogs = MutableStateFlow<List<String>>(
         listOf(
-            "Ready: WebRTC audio receiver 9098830C; AAC receiver CC1AD845 remains available.",
-            "WebRTC requires Android 10+, Google Play services, and capture consent.",
-            "The WebRTC audio module starts an internal microphone recorder; only overwritten playback PCM is sent."
+            "Ready: WebRTC Per-App UID Whitelist + Shizuku VolumeShaper Session Mute active.",
+            "WebRTC Cast Receiver: 9098830C (48 kHz / Stereo / PCM16).",
+            "Add and select at least one target app instance (Primary / Work / Clone) before starting."
         )
     )
     val protocolLogs: StateFlow<List<String>> = _protocolLogs.asStateFlow()
-
-    @Volatile
-    var selectedDevice: CastDeviceModel? = null
 
     @Volatile
     var isCaptureLocked: Boolean = false
@@ -91,6 +85,9 @@ object AudioCastSessionCoordinator {
     }
 
     fun markCleanupTimeout(message: String) {
+        // Immediate non-blocking mute restoration even when native audio HAL cleanup times out
+        ShizukuSessionMuteController.stopLeaseAndRestoreImmediately()
+        CaptureTargetRepository.clearFrozenTargetsSnapshot()
         isCaptureLocked = true
         _telemetry.update { current ->
             current.copy(
@@ -105,12 +102,13 @@ object AudioCastSessionCoordinator {
     }
 
     internal fun resetForTesting() {
+        ShizukuSessionMuteController.stopLeaseAndRestoreImmediately()
+        CaptureTargetRepository.resetForTesting()
         isCaptureLocked = false
-        selectedDevice = null
         _config.value = AudioStreamConfig()
         _telemetry.value = AudioPipelineTelemetry()
         _protocolLogs.value = listOf(
-            "Ready: WebRTC audio receiver 9098830C; AAC receiver CC1AD845 remains available."
+            "Ready: WebRTC audio receiver 9098830C."
         )
     }
 
@@ -118,35 +116,6 @@ object AudioCastSessionCoordinator {
         _protocolLogs.update { current ->
             (current + message).takeLast(60)
         }
-    }
-
-    fun resolveLocalLanIpAddress(): String {
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return "127.0.0.1"
-            for (intf in interfaces) {
-                if (!intf.isUp || intf.isLoopback) continue
-                for (addr in intf.inetAddresses) {
-                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
-                        val ip = addr.hostAddress ?: continue
-                        if (ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")) {
-                            return ip
-                        }
-                    }
-                }
-            }
-            val fallbackInterfaces = NetworkInterface.getNetworkInterfaces()
-            while (fallbackInterfaces.hasMoreElements()) {
-                val intf = fallbackInterfaces.nextElement()
-                if (!intf.isUp || intf.isLoopback) continue
-                for (addr in intf.inetAddresses) {
-                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
-                        return addr.hostAddress ?: "127.0.0.1"
-                    }
-                }
-            }
-        } catch (_: Exception) {
-        }
-        return "127.0.0.1"
     }
 }
 
@@ -157,7 +126,7 @@ class AudioCastCaptureService : Service() {
     private var sessionJob: Job? = null
     private var castStatusJob: Job? = null
     private var stopJob: Job? = null
-    private var activeMode: AudioCastMode? = null
+    private var sessionRunning = false
     @Volatile private var generation = 0L
     private var stopping = false
     private var destroyed = false
@@ -166,27 +135,23 @@ class AudioCastCaptureService : Service() {
     private var projectionCallback: MediaProjection.Callback? = null
     private var webRtcSession: WebRtcAudioSession? = null
     private var webRtcChannel: CastSignalingChannel? = null
-    private var captureEngine: AudioPlaybackCaptureEngine? = null
-    private var ktorServer: KtorAudioStreamServer? = null
-    private var castClient: CastV2ChannelClient? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP_AUDIO_CAST -> {
+                ShizukuSessionMuteController.stopLeaseAndRestoreImmediately()
+                CaptureTargetRepository.clearFrozenTargetsSnapshot()
                 if (cleanupTimedOut || AudioCastSessionCoordinator.isCaptureLocked) {
                     return START_NOT_STICKY
                 }
                 stopCastingSession()
             }
             ACTION_START_AUDIO_CAST -> {
-                if (activeMode != null || stopping || cleanupTimedOut || AudioCastSessionCoordinator.isCaptureLocked) {
+                if (sessionRunning || stopping || cleanupTimedOut || AudioCastSessionCoordinator.isCaptureLocked) {
                     return START_NOT_STICKY
                 }
-                val mode = intent.getStringExtra(EXTRA_MODE)?.let { value ->
-                    AudioCastMode.entries.firstOrNull { it.name == value }
-                } ?: AudioCastSessionCoordinator.config.value.mode
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
                 @Suppress("DEPRECATION")
                 val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -194,9 +159,11 @@ class AudioCastCaptureService : Service() {
                 } else {
                     intent.getParcelableExtra(EXTRA_RESULT_DATA)
                 }
-                startCastingPipeline(mode, resultCode, resultData)
+                startCastingPipeline(resultCode, resultData)
             }
             else -> {
+                ShizukuSessionMuteController.stopLeaseAndRestoreImmediately()
+                CaptureTargetRepository.clearFrozenTargetsSnapshot()
                 if (!cleanupTimedOut && !AudioCastSessionCoordinator.isCaptureLocked) {
                     stopSelf()
                 }
@@ -205,18 +172,12 @@ class AudioCastCaptureService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun promoteToForeground(mode: AudioCastMode) {
+    private fun promoteToForeground() {
         createNotificationChannel()
         val notification = buildForegroundNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            val hasRecordAudioPermission = ContextCompat.checkSelfPermission(
-                this,
-                android.Manifest.permission.RECORD_AUDIO
-            ) == PackageManager.PERMISSION_GRANTED
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
-                (mode == AudioCastMode.WEBRTC || hasRecordAudioPermission)
-            ) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             }
             try {
@@ -237,14 +198,21 @@ class AudioCastCaptureService : Service() {
         }
     }
 
-    private fun startCastingPipeline(mode: AudioCastMode, resultCode: Int, resultData: Intent?) {
+    private fun startCastingPipeline(resultCode: Int, resultData: Intent?) {
         if (AudioCastSessionCoordinator.isCaptureLocked) return
-        activeMode = mode
+        sessionRunning = true
         val token = ++generation
+        // Always satisfy Android 14+ foreground service start contract before any validation can throw
+        runCatching { promoteToForeground() }
+
+        val frozenTargets = CaptureTargetRepository.frozenTargets.value
+            ?: CaptureTargetRepository.selectedTargets.value
+
         AudioCastSessionCoordinator.updateTelemetry {
             AudioPipelineTelemetry(
                 isSessionActive = true,
-                webRtcStage = if (mode == AudioCastMode.WEBRTC) WebRtcStage.CAPTURING else WebRtcStage.IDLE
+                activeTargets = frozenTargets,
+                webRtcStage = WebRtcStage.CAPTURING
             )
         }
         try {
@@ -255,16 +223,54 @@ class AudioCastCaptureService : Service() {
                 PackageManager.PERMISSION_GRANTED) {
                 "RECORD_AUDIO permission is required."
             }
-            if (mode == AudioCastMode.WEBRTC) {
-                check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    "WebRTC playback capture requires Android 10 or later."
-                }
-                webRtcChannel = CastSdkSessionController.channel
-                check(webRtcChannel?.isConnected == true) {
-                    "Select a Cast receiver before starting WebRTC audio."
-                }
+            check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                "WebRTC playback capture requires Android 10 or later."
             }
-            promoteToForeground(mode)
+            webRtcChannel = CastSdkSessionController.channel
+            check(webRtcChannel?.isConnected == true) {
+                "Select a Cast receiver before starting WebRTC audio."
+            }
+
+            // Re-resolve full UIDs from the frozen target snapshot immediately before starting capture
+            val resolution = CaptureTargetRepository.resolveAndValidateFrozenTargets(applicationContext)
+            if (!resolution.isValid || resolution.resolvedUids.isEmpty()) {
+                error(resolution.failureReason ?: "目标应用完整 UID 解析与共享 UID 校验未通过。")
+            }
+            val targetUids = resolution.resolvedUids
+            AudioCastSessionCoordinator.appendLog(
+                "Resolved target UIDs for capture & session mute: ${targetUids.sorted()} " +
+                    "from ${frozenTargets.map { it.toStorageKey() }}"
+            )
+
+            // Acquire 3-second clock-time session mute lease and confirm initial active sessions via getMutedBy()
+            val leaseOutcome = ShizukuSessionMuteController.startSessionMuteLease(
+                targetUids = targetUids,
+                onFatalMuteError = { muteError ->
+                    serviceScope.launch(Dispatchers.Main.immediate) {
+                        if (generation == token && !stopping) {
+                            stopCastingSession(muteError)
+                        }
+                    }
+                }
+            )
+            if (!leaseOutcome.success) {
+                error(leaseOutcome.error ?: "初始播放器会话静音确认失败，已恢复会话并终止投放。")
+            }
+
+            AudioCastSessionCoordinator.updateTelemetry {
+                it.copy(
+                    activeTargets = frozenTargets,
+                    activeTargetUids = targetUids,
+                    isInitialMuteConfirmed = true
+                )
+            }
+            AudioCastSessionCoordinator.appendLog(
+                "Initial session mute confirmed via getMutedBy() " +
+                    "(active=${leaseOutcome.activeTargetPlayerCount}, " +
+                    "muted=${leaseOutcome.confirmedMutedPlayerCount}, " +
+                    "mask=0x${leaseOutcome.lastMixerMutedByMask.toString(16)})"
+            )
+
             val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             val projection = manager.getMediaProjection(resultCode, resultData)
                 ?: error("MediaProjection could not be acquired.")
@@ -278,17 +284,17 @@ class AudioCastCaptureService : Service() {
             }
             projectionCallback = callback
             projection.registerCallback(callback, Handler(Looper.getMainLooper()))
-            if (mode == AudioCastMode.WEBRTC) {
-                startWebRtcPipeline(projection, token)
-            } else {
-                startAacPipeline(projection, token)
-            }
+            startWebRtcPipeline(projection, targetUids, token)
         } catch (e: Exception) {
             stopCastingSession(e.message ?: "Unable to start audio capture.")
         }
     }
 
-    private fun startWebRtcPipeline(projection: MediaProjection, token: Long) {
+    private fun startWebRtcPipeline(
+        projection: MediaProjection,
+        targetUids: Set<Int>,
+        token: Long
+    ) {
         val channel = webRtcChannel?.takeIf { it.isConnected }
             ?: error("The Cast session ended before capture started.")
         val session = WebRtcAudioSession(
@@ -301,11 +307,15 @@ class AudioCastCaptureService : Service() {
                             ?: "WebRTC native audio cleanup timed out; capture is locked in this process."
                     )
                 } else if (generation == token && !stopping) {
+                    val muteReady = AudioCastSessionCoordinator.telemetry.value.isInitialMuteConfirmed
                     AudioCastSessionCoordinator.updateTelemetry {
                         it.copy(
                             webRtcStage = stage,
-                            isStreaming = stage == WebRtcStage.SENDING,
-                            videoPipelineAllocated = false
+                            isStreaming = muteReady && stage == WebRtcStage.SENDING,
+                            isHardwareCaptureActive = stage == WebRtcStage.CAPTURING ||
+                                stage == WebRtcStage.NEGOTIATING ||
+                                stage == WebRtcStage.CONNECTED ||
+                                stage == WebRtcStage.SENDING
                         )
                     }
                 }
@@ -323,6 +333,7 @@ class AudioCastCaptureService : Service() {
             },
             onPcmStats = { stats ->
                 if (generation == token && !stopping) {
+                    ShizukuSessionMuteController.recordAudioRmsForGateComparison(stats.rmsDb)
                     AudioCastSessionCoordinator.updateTelemetry {
                         it.copy(
                             pcmChunksRead = stats.chunksRead,
@@ -362,7 +373,7 @@ class AudioCastCaptureService : Service() {
         }
         sessionJob = serviceScope.launch {
             try {
-                session.start(projection)
+                session.start(projection, targetUids)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -373,99 +384,28 @@ class AudioCastCaptureService : Service() {
         }
     }
 
-    private fun startAacPipeline(projection: MediaProjection, token: Long) {
-        val server = KtorAudioStreamServer(
-            configProvider = { AudioCastSessionCoordinator.config.value },
-            onServerEvent = { msg -> AudioCastSessionCoordinator.appendLog(msg) },
-            onTelemetryUpdate = { clients, totalBytes, preBurstFrames ->
-                if (generation == token) {
-                    AudioCastSessionCoordinator.updateTelemetry {
-                        it.copy(
-                            connectedSpeakerClients = clients,
-                            totalBytesStreamed = totalBytes,
-                            preBurstFramesFlushedLastClient = preBurstFrames
-                        )
-                    }
-                }
-            }
-        )
-        ktorServer = server
-
-        val engine = AudioPlaybackCaptureEngine(
-            configProvider = { AudioCastSessionCoordinator.config.value },
-            onAdtsPacketEncoded = { adtsPacket ->
-                server.emitAdtsFrame(adtsPacket)
-            },
-            onStatsUpdated = { adtsFrames, silenceFrames, isSilentNow, rmsDb, minBufBytes ->
-                if (generation == token) {
-                    AudioCastSessionCoordinator.updateTelemetry {
-                        it.copy(
-                            adtsFramesEmitted = adtsFrames,
-                            silenceFramesInjected = silenceFrames,
-                            isInjectingSilenceNow = isSilentNow,
-                            currentRmsDb = rmsDb,
-                            audioRecordMinBufferBytes = minBufBytes,
-                            videoPipelineAllocated = false
-                        )
-                    }
-                }
-            },
-            onEngineLog = { msg -> AudioCastSessionCoordinator.appendLog(msg) },
-            context = applicationContext
-        )
-        captureEngine = engine
-
-        sessionJob = serviceScope.launch(Dispatchers.IO) {
-            try {
-                val port = server.startServer(preferredPort = 0)
-                ensureActive()
-                val streamUrl = server.buildStreamUrl(AudioCastSessionCoordinator.resolveLocalLanIpAddress())
-                engine.startAudioOnlyCapture(projection)
-                ensureActive()
-                if (generation != token) return@launch
-                AudioCastSessionCoordinator.updateTelemetry {
-                    it.copy(isStreaming = true, streamUrl = streamUrl, activeServerPort = port)
-                }
-                val targetDevice = AudioCastSessionCoordinator.selectedDevice
-                if (targetDevice != null) {
-                    val client = CastV2ChannelClient(
-                        device = targetDevice,
-                        onProtocolEvent = { event -> AudioCastSessionCoordinator.appendLog(event) }
-                    )
-                    castClient = client
-                    ensureActive()
-                    client.connectAndLoadLiveAudio(streamUrl)
-                } else {
-                    AudioCastSessionCoordinator.appendLog("AAC stream ready at $streamUrl; no receiver selected.")
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                serviceScope.launch(Dispatchers.Main) {
-                    if (generation == token) stopCastingSession(e.message ?: "AAC initialization failed.")
-                }
-            }
-        }
-    }
-
     private fun stopCastingSession(error: String? = null) {
+        // CRITICAL: Immediately cancel lease renewal and restore all muted sessions BEFORE waiting on native HAL
+        ShizukuSessionMuteController.stopLeaseAndRestoreImmediately(failureReason = error)
+        CaptureTargetRepository.clearFrozenTargetsSnapshot()
+
         if (stopping || cleanupTimedOut) return
-        if (activeMode == null) {
+        if (!sessionRunning) {
             if (error != null) AudioCastSessionCoordinator.updateTelemetry { it.copy(error = error) }
-            if (!destroyed && !AudioCastSessionCoordinator.isCaptureLocked) stopSelf()
+            if (!destroyed && !AudioCastSessionCoordinator.isCaptureLocked) {
+                runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+                stopSelf()
+            }
             return
         }
         stopping = true
         generation++
-        val mode = activeMode
         var finalError = error
         val startingJob = sessionJob
         sessionJob = null
-        if (mode != AudioCastMode.WEBRTC) startingJob?.cancel()
         castStatusJob?.cancel()
         castStatusJob = null
 
-        // Unregister MediaProjection callback immediately during logical stop so late callbacks are ignored.
         projectionCallback?.let { callback ->
             runCatching { mediaProjection?.unregisterCallback(callback) }
         }
@@ -474,7 +414,7 @@ class AudioCastCaptureService : Service() {
         AudioCastSessionCoordinator.updateTelemetry {
             it.copy(
                 isStreaming = false,
-                webRtcStage = if (mode == AudioCastMode.WEBRTC) WebRtcStage.STOPPING else it.webRtcStage,
+                webRtcStage = WebRtcStage.STOPPING,
                 error = error ?: it.error
             )
         }
@@ -510,25 +450,10 @@ class AudioCastCaptureService : Service() {
                 }
                 webRtcChannel?.endSession()
                 webRtcChannel = null
-                if (!timedOutCleanup) {
-                    withContext(Dispatchers.IO) {
-                        runCatching { castClient?.disconnect() }
-                        castClient = null
-                        runCatching { captureEngine?.release() }.onFailure {
-                            nativeCleanupFailed = true
-                            finalError = finalError ?: "AAC cleanup failed: ${it.message}"
-                        }
-                        captureEngine = null
-                        runCatching { ktorServer?.stopServer() }.onFailure {
-                            finalError = finalError ?: "AAC server cleanup failed: ${it.message}"
-                        }
-                        ktorServer = null
-                    }
-                }
             } finally {
                 if (timedOutCleanup) {
                     cleanupTimedOut = true
-                    activeMode = null
+                    sessionRunning = false
                     stopping = false
                     val timeoutMessage = finalError
                         ?: "WebRTC native audio cleanup timed out; capture is locked in this process."
@@ -553,7 +478,7 @@ class AudioCastCaptureService : Service() {
                             }
                         }
                     }
-                    activeMode = null
+                    sessionRunning = false
                     stopping = false
                     if (!destroyed) {
                         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -561,17 +486,13 @@ class AudioCastCaptureService : Service() {
                     }
                     AudioCastSessionCoordinator.updateTelemetry {
                         AudioPipelineTelemetry(
-                            webRtcStage = if (finalError != null && mode == AudioCastMode.WEBRTC) {
-                                WebRtcStage.ERROR
-                            } else {
-                                WebRtcStage.IDLE
-                            },
+                            webRtcStage = if (finalError != null) WebRtcStage.ERROR else WebRtcStage.IDLE,
                             error = finalError
                         )
                     }
                     AudioCastSessionCoordinator.appendLog(
-                        if (finalError == null) "Audio cast session stopped."
-                        else "Audio cast stopped with error: $finalError"
+                        if (finalError == null) "Audio cast session stopped and session mute envelope removed."
+                        else "Audio cast stopped with error ($finalError); session mute envelope removed."
                     )
                 }
                 if (destroyed) teardownScope.cancel()
@@ -581,6 +502,8 @@ class AudioCastCaptureService : Service() {
 
     override fun onDestroy() {
         destroyed = true
+        ShizukuSessionMuteController.stopLeaseAndRestoreImmediately()
+        CaptureTargetRepository.clearFrozenTargetsSnapshot()
         stopCastingSession()
         serviceScope.cancel()
         if (stopJob?.isActive != true) teardownScope.cancel()
@@ -618,12 +541,11 @@ class AudioCastCaptureService : Service() {
                 else getString(R.string.notification_title)
             )
             .setContentText(
-                when {
-                    isCleanupTimedOut -> timeoutMessage
+                if (isCleanupTimedOut) {
+                    timeoutMessage
                         ?: "Native audio cleanup did not finish; restart the app before capturing again."
-                    activeMode == AudioCastMode.WEBRTC ->
-                        "WebRTC playback capture active; internal microphone recorder in use"
-                    else -> getString(R.string.notification_text)
+                } else {
+                    "WebRTC per-UID capture + Shizuku session mute active"
                 }
             )
             .setContentIntent(pendingOpen)
@@ -653,7 +575,6 @@ class AudioCastCaptureService : Service() {
         const val ACTION_STOP_AUDIO_CAST = "io.github.ddagunts.screencast.action.STOP_AUDIO_CAST"
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"
-        const val EXTRA_MODE = "extra_mode"
 
         private const val CHANNEL_ID = "screencast_audio_low_latency"
         private const val NOTIFICATION_ID = 8009

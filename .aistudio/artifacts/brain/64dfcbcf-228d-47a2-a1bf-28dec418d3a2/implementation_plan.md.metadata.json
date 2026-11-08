@@ -1,6 +1,6 @@
 {
-  "summary": "Android 14 真机 Can only use lower 16 bits for requestCode 报错修复与前台服务/权限流加固方案",
-  "updatedAt": "2026-11-06T15:17:20.223349119Z",
-  "requestFeedback": true,
-  "userFacing": true
+  "summary":  "Implementation plan for removing AAC/HTTP capture and default Audio/Video category presets, refactoring the app into a pure WebRTC per-app audio caster with a redesigned visual Bottom Sheet App Picker (with real app icons, profile tabs, and search) and a streamlined Console UI with a collapsible diagnostics drawer.",
+  "updatedAt":  "2026-11-08T03:10:32.686418198Z",
+  "requestFeedback":  true,
+  "userFacing":  true
 }

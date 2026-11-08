@@ -10,12 +10,10 @@ import android.media.projection.MediaProjection
 import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
 import io.github.ddagunts.screencast.cast.CastSignalingChannel
-import io.github.ddagunts.screencast.media.AudioCastMode
 import io.github.ddagunts.screencast.media.AudioCastSessionCoordinator
 import io.github.ddagunts.screencast.ui.ScreenCastViewModel
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -474,12 +472,9 @@ class WebRtcHalFaultInjectionTest {
         assertTrue(AudioCastSessionCoordinator.isCaptureLocked)
         assertEquals(WebRtcStage.CLEANUP_TIMEOUT, viewModel.telemetry.value.webRtcStage)
         assertTrue(viewModel.telemetry.value.isCaptureLocked)
-        assertFalse(viewModel.prepareCaptureRequest())
+        assertFalse(viewModel.prepareCaptureRequest(requireConnectedCastReceiver = false))
 
-        // Attempting to change mode, stop, or start with projection must not clear CLEANUP_TIMEOUT or error.
-        viewModel.setCastMode(AudioCastMode.AAC)
-        assertEquals(AudioCastMode.WEBRTC, viewModel.config.value.mode)
-
+        // Attempting to stop or start with projection must not clear CLEANUP_TIMEOUT or error.
         viewModel.stopAudioCast()
         assertEquals(WebRtcStage.CLEANUP_TIMEOUT, viewModel.telemetry.value.webRtcStage)
         assertEquals(

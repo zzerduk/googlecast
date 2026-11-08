@@ -15,3 +15,12 @@ cleanup.
 The experimental WebRTC mode uses the upstream hosted receiver and App ID
 `9098830C`. Product distribution requires confirmation of permission to use
 that receiver or deployment and registration of a separately owned receiver.
+
+## Shizuku-API
+
+This application uses `dev.rikka.shizuku:api` and `dev.rikka.shizuku:provider`
+(version `13.1.5`) from `RikkaApps/Shizuku-API` to bind a minimal shell-context
+`UserService` for multi-profile package resolution and per-session `VolumeShaper`
+mute control. Shizuku-API is licensed under the MIT License; the full license
+text is included in `app/src/main/assets/licenses/Shizuku-API-LICENSE.txt`.
+

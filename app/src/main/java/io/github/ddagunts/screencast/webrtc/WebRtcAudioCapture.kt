@@ -1,12 +1,11 @@
 package io.github.ddagunts.screencast.webrtc
 
 import android.annotation.SuppressLint
-import android.media.AudioAttributes
 import android.media.AudioFormat
-import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.os.Build
+import io.github.ddagunts.screencast.media.PlaybackCaptureConfigBuilder
 import org.webrtc.audio.JavaAudioDeviceModule
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
@@ -25,7 +24,20 @@ internal interface PlaybackAudioRecorder {
 }
 
 internal fun interface PlaybackAudioRecorderFactory {
-    fun create(projection: MediaProjection, sampleRate: Int, bufferBytes: Int): PlaybackAudioRecorder
+    fun create(
+        projection: MediaProjection,
+        sampleRate: Int,
+        bufferBytes: Int,
+        targetUids: Set<Int>
+    ): PlaybackAudioRecorder
+
+    companion object {
+        fun fromLegacy(
+            legacy: (MediaProjection, Int, Int) -> PlaybackAudioRecorder
+        ): PlaybackAudioRecorderFactory = PlaybackAudioRecorderFactory { projection, sampleRate, bufferBytes, _ ->
+            legacy(projection, sampleRate, bufferBytes)
+        }
+    }
 }
 
 class WebRtcAudioCapture internal constructor(
@@ -37,6 +49,22 @@ class WebRtcAudioCapture internal constructor(
     private val recorderFactory: PlaybackAudioRecorderFactory = DefaultPlaybackAudioRecorderFactory
 ) : JavaAudioDeviceModule.AudioBufferCallback {
 
+    internal constructor(
+        onError: (String) -> Unit,
+        onStats: (PcmCaptureStats) -> Unit,
+        onLog: (String) -> Unit,
+        cleanupTimeoutMs: Long = WEBRTC_CLEANUP_TIMEOUT_MS,
+        minBufferSizeProvider: (Int, Int, Int) -> Int = AudioRecord::getMinBufferSize,
+        recorderFactory: (MediaProjection, Int, Int) -> PlaybackAudioRecorder
+    ) : this(
+        onError = onError,
+        onStats = onStats,
+        onLog = onLog,
+        cleanupTimeoutMs = cleanupTimeoutMs,
+        minBufferSizeProvider = minBufferSizeProvider,
+        recorderFactory = PlaybackAudioRecorderFactory.fromLegacy(recorderFactory)
+    )
+
     constructor(
         onError: (String) -> Unit,
         onStats: (PcmCaptureStats) -> Unit,
@@ -45,7 +73,9 @@ class WebRtcAudioCapture internal constructor(
         onError = onError,
         onStats = onStats,
         onLog = onLog,
-        cleanupTimeoutMs = WEBRTC_CLEANUP_TIMEOUT_MS
+        cleanupTimeoutMs = WEBRTC_CLEANUP_TIMEOUT_MS,
+        minBufferSizeProvider = AudioRecord::getMinBufferSize,
+        recorderFactory = DefaultPlaybackAudioRecorderFactory
     )
 
     private val pcm = WebRtcPcmBuffer()
@@ -62,6 +92,8 @@ class WebRtcAudioCapture internal constructor(
     @Volatile private var cleanupWorkerThread: Thread? = null
     @Volatile private var cleanupError: Throwable? = null
     @Volatile private var minBufferBytes = 0
+    @Volatile var activeTargetUids: Set<Int> = emptySet()
+        private set
 
     internal val isCleanupTimedOut: Boolean
         get() = cleanupTimedOut.get()
@@ -71,7 +103,7 @@ class WebRtcAudioCapture internal constructor(
 
     @SuppressLint("MissingPermission")
     @Synchronized
-    fun attachProjection(projection: MediaProjection) {
+    fun attachProjection(projection: MediaProjection, targetUids: Set<Int> = emptySet()) {
         check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             "System audio capture requires Android 10 or newer"
         }
@@ -79,6 +111,7 @@ class WebRtcAudioCapture internal constructor(
             "Audio capture is already closed"
         }
         if (audioRecord != null) return
+        activeTargetUids = targetUids
         val minimum = minBufferSizeProvider(
             WEBRTC_AUDIO_SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_STEREO,
@@ -87,7 +120,12 @@ class WebRtcAudioCapture internal constructor(
         check(minimum > 0) { "AudioRecord minimum buffer query failed: $minimum" }
         minBufferBytes = minimum
         val bufferBytes = maxOf(minimum, WebRtcPcmBuffer.CHUNK_BYTES * 8)
-        val record = recorderFactory.create(projection, WEBRTC_AUDIO_SAMPLE_RATE, bufferBytes)
+        val record = recorderFactory.create(
+            projection = projection,
+            sampleRate = WEBRTC_AUDIO_SAMPLE_RATE,
+            bufferBytes = bufferBytes,
+            targetUids = targetUids
+        )
         audioRecord = record
         try {
             check(record.state == AudioRecord.STATE_INITIALIZED) {
@@ -118,7 +156,10 @@ class WebRtcAudioCapture internal constructor(
             }
             throw error
         }
-        onLog("Playback PCM capture ready: 48000 Hz, stereo PCM16, buffer=${bufferBytes}B")
+        onLog(
+            "Playback PCM capture ready: 48000 Hz, stereo PCM16, buffer=${bufferBytes}B, " +
+                "matchingUids=${targetUids.sorted()}"
+        )
         publishStats(force = true)
     }
 
@@ -381,149 +422,69 @@ class WebRtcAudioCapture internal constructor(
         return false
     }
 
-    private object DefaultPlaybackAudioRecorderFactory : PlaybackAudioRecorderFactory {
+    /**
+     * Hardware recorder factory that uses [PlaybackCaptureConfigBuilder] to apply
+     * `addMatchingUid` for every target UID alongside `USAGE_MEDIA`, `USAGE_GAME`, `USAGE_UNKNOWN`.
+     *
+     * Never substitutes a silent fallback recorder when hardware capture fails—failures surface
+     * immediately so hardware capture failure or pure silence never masquerades as valid capture.
+     */
+    internal object DefaultPlaybackAudioRecorderFactory : PlaybackAudioRecorderFactory {
         @SuppressLint("MissingPermission")
         override fun create(
             projection: MediaProjection,
             sampleRate: Int,
-            bufferBytes: Int
+            bufferBytes: Int,
+            targetUids: Set<Int>
         ): PlaybackAudioRecorder {
-            if (io.github.ddagunts.screencast.media.AudioPlaybackCaptureEngine.isEmulatorAudioHalEnvironment()) {
-                return PacedSilentPlaybackAudioRecorder(sampleRate)
+            check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                "AudioPlaybackCapture requires Android 10+"
             }
-            val captureConfig = AudioPlaybackCaptureConfiguration.Builder(projection)
-                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                .build()
+            check(targetUids.isNotEmpty()) {
+                "Target UID whitelist must not be empty when creating WebRTC PlaybackAudioRecorder"
+            }
+            val captureConfig = PlaybackCaptureConfigBuilder.build(
+                projection = projection,
+                targetUids = targetUids
+            )
             val format = AudioFormat.Builder()
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .setSampleRate(sampleRate)
                 .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
                 .build()
-            val record = try {
-                AudioRecord.Builder()
-                    .setAudioPlaybackCaptureConfig(captureConfig)
-                    .setAudioFormat(format)
-                    .setBufferSizeInBytes(bufferBytes)
-                    .build()
-            } catch (_: Exception) {
-                return PacedSilentPlaybackAudioRecorder(sampleRate)
-            }
-            if (record.state != AudioRecord.STATE_INITIALIZED) {
-                runCatching { record.release() }
-                return PacedSilentPlaybackAudioRecorder(sampleRate)
-            }
-            return object : PlaybackAudioRecorder {
-                private val fallbackSilence = PacedSilentPlaybackAudioRecorder(sampleRate)
-                private val usingFallback = AtomicBoolean(false)
+            val record = AudioRecord.Builder()
+                .setAudioPlaybackCaptureConfig(captureConfig)
+                .setAudioFormat(format)
+                .setBufferSizeInBytes(bufferBytes)
+                .build()
 
+            return object : PlaybackAudioRecorder {
                 override val state: Int
-                    get() = if (usingFallback.get()) fallbackSilence.state else record.state
+                    get() = record.state
                 override val recordingState: Int
-                    get() = if (usingFallback.get()) fallbackSilence.recordingState else record.recordingState
+                    get() = record.recordingState
 
                 override fun startRecording() {
-                    try {
-                        record.startRecording()
-                        if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                            retireNativeToFallback()
-                        } else {
-                            fallbackSilence.startRecording()
-                        }
-                    } catch (_: Exception) {
-                        retireNativeToFallback()
-                    }
+                    record.startRecording()
                 }
 
                 override fun read(audioData: ByteArray, offsetInBytes: Int, sizeInBytes: Int): Int {
-                    if (usingFallback.get()) {
-                        return fallbackSilence.read(audioData, offsetInBytes, sizeInBytes)
-                    }
-                    val bytesRead = try {
-                        record.read(
-                            audioData,
-                            offsetInBytes,
-                            sizeInBytes,
-                            AudioRecord.READ_BLOCKING
-                        )
-                    } catch (_: Exception) {
-                        AudioRecord.ERROR_BAD_VALUE
-                    }
-                    if (bytesRead <= 0) {
-                        retireNativeToFallback()
-                        return fallbackSilence.read(audioData, offsetInBytes, sizeInBytes)
-                    }
-                    return bytesRead
+                    return record.read(
+                        audioData,
+                        offsetInBytes,
+                        sizeInBytes,
+                        AudioRecord.READ_BLOCKING
+                    )
                 }
 
                 override fun stop() {
-                    fallbackSilence.stop()
-                    if (!usingFallback.get()) {
-                        runCatching { record.stop() }
-                    }
+                    record.stop()
                 }
 
                 override fun release() {
-                    fallbackSilence.release()
-                    if (!usingFallback.getAndSet(true)) {
-                        runCatching { record.release() }
-                    }
-                }
-
-                private fun retireNativeToFallback() {
-                    if (usingFallback.compareAndSet(false, true)) {
-                        fallbackSilence.startRecording()
-                        runCatching {
-                            if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                                record.stop()
-                            }
-                        }
-                        runCatching { record.release() }
-                    }
+                    record.release()
                 }
             }
-        }
-    }
-
-    private class PacedSilentPlaybackAudioRecorder(
-        private val sampleRate: Int
-    ) : PlaybackAudioRecorder {
-        private val isRecording = AtomicBoolean(false)
-
-        override val state: Int = AudioRecord.STATE_INITIALIZED
-        override val recordingState: Int
-            get() = if (isRecording.get()) {
-                AudioRecord.RECORDSTATE_RECORDING
-            } else {
-                AudioRecord.RECORDSTATE_STOPPED
-            }
-
-        override fun startRecording() {
-            isRecording.set(true)
-        }
-
-        override fun read(audioData: ByteArray, offsetInBytes: Int, sizeInBytes: Int): Int {
-            if (!isRecording.get() || sizeInBytes <= 0) return 0
-            val frames = (sizeInBytes / 4).coerceAtLeast(1)
-            val sleepMs = ((frames * 1000L) / sampleRate.coerceAtLeast(8000)).coerceIn(5L, 25L)
-            try {
-                Thread.sleep(sleepMs)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return 0
-            }
-            if (!isRecording.get()) return 0
-            audioData.fill(0, offsetInBytes, (offsetInBytes + sizeInBytes).coerceAtMost(audioData.size))
-            return sizeInBytes
-        }
-
-        override fun stop() {
-            isRecording.set(false)
-        }
-
-        override fun release() {
-            isRecording.set(false)
         }
     }
 

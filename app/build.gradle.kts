@@ -62,6 +62,7 @@ android {
   buildFeatures {
     compose = true
     buildConfig = true
+    aidl = true
   }
   packaging {
     resources {
@@ -130,10 +131,12 @@ dependencies {
   // implementation(libs.firebase.appcheck.debug)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
-  implementation(libs.ktor.server.core)
-  implementation(libs.ktor.server.cio)
+  // implementation(libs.ktor.server.core)
+  // implementation(libs.ktor.server.cio)
   implementation(libs.play.services.cast.framework)
   implementation(libs.webrtc.sdk.android)
+  implementation(libs.shizuku.api)
+  implementation(libs.shizuku.provider)
   // implementation(libs.logging.interceptor)
   // implementation(libs.moshi.kotlin)
   // implementation(libs.okhttp)

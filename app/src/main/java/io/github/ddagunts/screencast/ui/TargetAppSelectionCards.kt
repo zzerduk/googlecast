@@ -81,11 +81,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.material.icons.filled.BookmarkAdd
+import androidx.compose.material.icons.filled.Bookmarks
+import androidx.compose.material.icons.filled.Close
 import io.github.ddagunts.screencast.media.AudioPipelineTelemetry
 import io.github.ddagunts.screencast.target.CaptureTarget
 import io.github.ddagunts.screencast.target.ProfileType
 import io.github.ddagunts.screencast.target.SessionMuteTelemetry
 import io.github.ddagunts.screencast.target.TargetAppEntry
+import io.github.ddagunts.screencast.target.TargetPreset
 import io.github.ddagunts.screencast.target.UserProfileInfo
 import kotlin.math.roundToInt
 
@@ -95,11 +99,17 @@ fun TargetAppSelectorCard(
     catalogApps: List<TargetAppEntry>,
     selectedTargets: Set<CaptureTarget>,
     importedTargets: Set<CaptureTarget>,
-     isEditingLocked: Boolean,
+    presets: List<TargetPreset> = emptyList(),
+    isEditingLocked: Boolean,
     onToggleTarget: (CaptureTarget) -> Unit,
     onClearTargets: () -> Unit,
     onOpenImportDialog: () -> Unit,
     onRemoveImportedTarget: (CaptureTarget) -> Unit,
+    onSavePreset: (String) -> Result<TargetPreset> = {
+        Result.failure(IllegalStateException("Not wired"))
+    },
+    onApplyPreset: (String) -> Unit = {},
+    onDeletePreset: (String) -> Unit = {},
     onRefreshCatalog: () -> Unit
 ) {
     Card(
@@ -204,13 +214,23 @@ fun TargetAppSelectorCard(
                             modifier = Modifier.size(18.dp)
                         )
                         Text(
-                            text = "授权或投音进行中：目标快照已冻结，停止投音后可增删或修改目标应用。",
+                            text = "授权或投音进行中：目标与快捷组合已锁定，停止投音后可增删、修改目标或切换组合。",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurface
                         )
                     }
                 }
             }
+
+            // Embedded TargetPreset Chip Bar
+            TargetPresetChipBar(
+                presets = presets,
+                selectedTargets = selectedTargets,
+                isEditingLocked = isEditingLocked,
+                onSavePreset = onSavePreset,
+                onApplyPreset = onApplyPreset,
+                onDeletePreset = onDeletePreset
+            )
 
             if (selectedTargets.isNotEmpty() && !isEditingLocked) {
                 Row(
@@ -266,7 +286,7 @@ fun TargetAppSelectorCard(
                     catalogApps.forEach { entry ->
                         val isSelected = entry.target in selectedTargets
                         val isImported = entry.target in importedTargets
-                        val canInteract = entry.isSelectable && !isEditingLocked
+                        val canInteract = (entry.isSelectable || isSelected) && !isEditingLocked
                         val sharedSiblingsWarning = if (entry.sharedUidPackages.size > 1) {
                             val unselectedSiblings = entry.sharedUidPackages.filter { pkg ->
                                 CaptureTarget(pkg, entry.target.userSerialNumber) !in selectedTargets
@@ -281,7 +301,7 @@ fun TargetAppSelectorCard(
                         Surface(
                             shape = RoundedCornerShape(14.dp),
                             color = when {
-                                entry.isCaptureRestrictedByManifest || !entry.isProfileRunning || !entry.isInstalled ->
+                                !entry.isSelectable ->
                                     MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.22f)
                                 isSelected ->
                                     MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
@@ -411,6 +431,220 @@ fun TargetAppSelectorCard(
                                         enabled = canInteract,
                                         modifier = Modifier.testTag("checkbox_${entry.target.toStorageKey()}")
                                     )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun TargetPresetChipBar(
+    presets: List<TargetPreset>,
+    selectedTargets: Set<CaptureTarget>,
+    isEditingLocked: Boolean,
+    onSavePreset: (String) -> Result<TargetPreset>,
+    onApplyPreset: (String) -> Unit,
+    onDeletePreset: (String) -> Unit
+) {
+    var showSaveInput by rememberSaveable { mutableStateOf(false) }
+    var presetNameDraft by rememberSaveable { mutableStateOf("") }
+    var presetErrorMessage by rememberSaveable { mutableStateOf<String?>(null) }
+
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("target_presets_bar")
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Bookmarks,
+                        contentDescription = "目标快捷组合",
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = "目标快捷组合 (${presets.size})",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+
+                AssistChip(
+                    onClick = {
+                        presetErrorMessage = null
+                        showSaveInput = !showSaveInput
+                    },
+                    enabled = !isEditingLocked && selectedTargets.isNotEmpty(),
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Filled.BookmarkAdd,
+                            contentDescription = "保存当前选择为组合",
+                            modifier = Modifier.size(16.dp)
+                        )
+                    },
+                    label = {
+                        Text(
+                            text = if (showSaveInput) "收起保存" else "+ 保存当前选择",
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    },
+                    modifier = Modifier.testTag("open_save_preset_button")
+                )
+            }
+
+            AnimatedVisibility(visible = showSaveInput && !isEditingLocked) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = presetNameDraft,
+                            onValueChange = {
+                                presetNameDraft = it
+                                presetErrorMessage = null
+                            },
+                            placeholder = { Text("输入组合名称 (不重复)...") },
+                            singleLine = true,
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("preset_name_input")
+                        )
+                        Button(
+                            onClick = {
+                                val res = onSavePreset(presetNameDraft)
+                                res.onSuccess {
+                                    presetNameDraft = ""
+                                    presetErrorMessage = null
+                                    showSaveInput = false
+                                }.onFailure { err ->
+                                    presetErrorMessage = err.message ?: "保存组合失败"
+                                }
+                            },
+                            enabled = presetNameDraft.trim().isNotEmpty() && selectedTargets.isNotEmpty() && !isEditingLocked,
+                            modifier = Modifier.testTag("confirm_save_preset_button")
+                        ) {
+                            Text("保存组合")
+                        }
+                    }
+                    presetErrorMessage?.let { err ->
+                        Text(
+                            text = err,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.testTag("preset_error_text")
+                        )
+                    }
+                }
+            }
+
+            if (presets.isEmpty()) {
+                Text(
+                    text = if (selectedTargets.isEmpty()) {
+                        "尚无保存的目标组合 • 先勾选至少 1 个应用即可保存快捷组合"
+                    } else {
+                        "尚无保存的目标组合 • 点击右上角「+ 保存当前选择」创建命名组合"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.testTag("empty_presets_hint")
+                )
+            } else {
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    presets.forEach { preset ->
+                        val isActiveMatch = preset.targets == selectedTargets && selectedTargets.isNotEmpty()
+                        Surface(
+                            shape = RoundedCornerShape(50),
+                            color = if (isActiveMatch) {
+                                MaterialTheme.colorScheme.primaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.surface
+                            },
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .border(
+                                    width = 1.dp,
+                                    color = if (isActiveMatch) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.outlineVariant
+                                    },
+                                    shape = RoundedCornerShape(50)
+                                )
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp)
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(50))
+                                        .clickable(enabled = !isEditingLocked) {
+                                            onApplyPreset(preset.name)
+                                        }
+                                        .padding(vertical = 4.dp, horizontal = 4.dp)
+                                        .testTag("preset_chip_${preset.name}")
+                                ) {
+                                    if (isActiveMatch) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Check,
+                                            contentDescription = "当前已选组合",
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                    }
+                                    Text(
+                                        text = "${preset.name} (${preset.targets.size})",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = if (isEditingLocked) {
+                                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurface
+                                        }
+                                    )
+                                }
+                                if (!isEditingLocked) {
+                                    IconButton(
+                                        onClick = { onDeletePreset(preset.name) },
+                                        modifier = Modifier
+                                            .size(28.dp)
+                                            .testTag("delete_preset_${preset.name}")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Close,
+                                            contentDescription = "删除组合 ${preset.name}",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                    }
                                 }
                             }
                         }

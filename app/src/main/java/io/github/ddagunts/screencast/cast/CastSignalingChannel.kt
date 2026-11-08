@@ -14,6 +14,10 @@ data class CastSdkSessionStatus(
     val isConnecting: Boolean = false,
     val isConnected: Boolean = false,
     val deviceName: String = "",
+    val volume: Double = 0.0,
+    val isMuted: Boolean = false,
+    val isVolumeControlAvailable: Boolean = false,
+    val volumeControlError: String? = null,
     val error: String? = null,
     val sessionGeneration: Long = 0
 )

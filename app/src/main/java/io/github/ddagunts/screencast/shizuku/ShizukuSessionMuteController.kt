@@ -11,7 +11,9 @@ import android.os.Process
 import android.os.UserManager
 import com.example.BuildConfig
 import io.github.ddagunts.screencast.target.CaptureTarget
+import io.github.ddagunts.screencast.target.PhoneOutputMode
 import io.github.ddagunts.screencast.target.ProfileType
+import io.github.ddagunts.screencast.target.PublicApiTargetResolver
 import io.github.ddagunts.screencast.target.SessionMuteTelemetry
 import io.github.ddagunts.screencast.target.ShizukuConnectionState
 import io.github.ddagunts.screencast.target.TargetAppEntry
@@ -119,6 +121,7 @@ object ShizukuSessionMuteController {
     }
 
     internal fun resetToDefaultBackend() {
+        PublicApiTargetResolver.resetEnvironmentForTesting()
         installBackendForTesting(RealShizukuMuteBackend())
         _muteTelemetry.value = SessionMuteTelemetry(shizukuState = backend.connectionState.value)
     }
@@ -148,15 +151,34 @@ object ShizukuSessionMuteController {
 
     fun queryCatalog(context: Context, importedTargets: Set<CaptureTarget>): MultiProfileCatalogSnapshot {
         syncShizukuConnectionState()
-        return backend.queryCatalog(context, importedTargets)
+        return if (backend.connectionState.value == ShizukuConnectionState.READY) {
+            backend.queryCatalog(context, importedTargets)
+        } else {
+            PublicApiTargetResolver.queryCatalog(context, importedTargets)
+        }
     }
 
     fun resolveAndValidateTargets(
         context: Context,
-        selectedTargets: Set<CaptureTarget>
+        selectedTargets: Set<CaptureTarget>,
+        outputMode: PhoneOutputMode = PhoneOutputMode.SHIZUKU_SESSION_MUTE
     ): TargetResolutionResult {
         syncShizukuConnectionState()
-        return backend.resolveAndValidateTargets(context, selectedTargets)
+        val isShizukuReady = backend.connectionState.value == ShizukuConnectionState.READY
+        return when {
+            outputMode == PhoneOutputMode.SHIZUKU_SESSION_MUTE -> {
+                if (!isShizukuReady) {
+                    TargetResolutionResult(
+                        isValid = false,
+                        failureReason = "Shizuku Shell 服务未就绪 (${backend.connectionState.value.statusLabel})，定向静音无法启动。"
+                    )
+                } else {
+                    backend.resolveAndValidateTargets(context, selectedTargets)
+                }
+            }
+            isShizukuReady -> backend.resolveAndValidateTargets(context, selectedTargets)
+            else -> PublicApiTargetResolver.resolveAndValidateTargets(context, selectedTargets)
+        }
     }
 
     fun startSessionMuteLease(
@@ -692,155 +714,6 @@ internal class RealShizukuMuteBackend : ShizukuMuteBackend {
         context: Context,
         importedTargets: Set<CaptureTarget>
     ): MultiProfileCatalogSnapshot {
-        val pm = context.packageManager
-        val userManager = context.getSystemService(Context.USER_SERVICE) as? UserManager
-        val launcherApps = context.getSystemService(Context.LAUNCHER_APPS_SERVICE) as? LauncherApps
-        val profiles = mutableListOf<UserProfileInfo>()
-        val seenSerials = HashSet<Long>()
-
-        val userHandles = launcherApps?.profiles ?: listOf(Process.myUserHandle())
-        for ((idx, handle) in userHandles.withIndex()) {
-            val serial = userManager?.getSerialNumberForUser(handle) ?: idx.toLong()
-            if (!seenSerials.add(serial)) continue
-            val isPrimary = handle == Process.myUserHandle() && idx == 0
-            val pType = when {
-                isPrimary -> ProfileType.PRIMARY
-                idx == 1 -> ProfileType.WORK
-                else -> ProfileType.CLONE
-            }
-            val label = when (pType) {
-                ProfileType.PRIMARY -> "主空间 (Serial $serial)"
-                ProfileType.WORK -> "工作资料 (Serial $serial)"
-                ProfileType.CLONE -> "克隆资料 (Serial $serial)"
-                ProfileType.OTHER -> "空间 #$serial"
-            }
-            profiles.add(
-                UserProfileInfo(
-                    userSerialNumber = serial,
-                    userId = idx,
-                    label = label,
-                    profileType = pType,
-                    isRunning = true
-                )
-            )
-        }
-        if (profiles.isEmpty()) {
-            profiles.add(UserProfileInfo(0L, 0, "主空间", ProfileType.PRIMARY, true))
-        }
-
-        val catalogApps = mutableListOf<TargetAppEntry>()
-        val searchableApps = mutableListOf<TargetAppEntry>()
-        val seenSearchableKeys = HashSet<String>()
-        val seenCatalogKeys = HashSet<String>()
-
-        // Discover launchable apps across all profiles via LauncherApps
-        if (launcherApps != null) {
-            for ((idx, handle) in userHandles.withIndex()) {
-                val profile = profiles.getOrNull(idx) ?: profiles.first()
-                val activities = runCatching {
-                    launcherApps.getActivityList(null, handle)
-                }.getOrDefault(emptyList())
-                for (activityInfo in activities) {
-                    val appInfo = activityInfo.applicationInfo ?: continue
-                    val pkg = appInfo.packageName ?: continue
-                    val target = CaptureTarget(pkg, profile.userSerialNumber)
-                    val label = runCatching { activityInfo.label?.toString() }.getOrNull()
-                        ?.takeIf { it.isNotBlank() } ?: pkg
-                    val isAllowedByFlag = runCatching {
-                        val m = ApplicationInfo::class.java.getMethod("isAudioPlaybackCaptureAllowed")
-                        (m.invoke(appInfo) as? Boolean) ?: true
-                    }.getOrDefault(true)
-                    val isRestricted = !isAllowedByFlag
-                    val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 &&
-                        (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
-                    val siblings = runCatching { pm.getPackagesForUid(appInfo.uid)?.toList().orEmpty() }.getOrDefault(emptyList())
-
-                    val entry = TargetAppEntry(
-                        target = target,
-                        appLabel = label,
-                        profileType = profile.profileType,
-                        profileLabel = profile.label,
-                        isInstalled = true,
-                        isProfileRunning = profile.isRunning,
-                        isSystemApp = isSystem,
-                        resolvedUid = appInfo.uid,
-                        sharedUidPackages = siblings,
-                        isCaptureRestrictedByManifest = isRestricted,
-                        statusReason = if (isRestricted) "系统禁采 (allowAudioPlaybackCapture=false)" else null
-                    )
-                    if (seenSearchableKeys.add(target.toStorageKey())) {
-                        searchableApps.add(entry)
-                    }
-                    if (target in importedTargets && seenCatalogKeys.add(target.toStorageKey())) {
-                        catalogApps.add(entry)
-                    }
-                }
-            }
-        }
-
-        // Also scan primary profile's PackageManager for any non-launcher packages
-        val primaryProfile = profiles.first()
-        val installedApps = runCatching { pm.getInstalledApplications(0) }.getOrDefault(emptyList())
-        for (appInfo in installedApps) {
-            val pkg = appInfo.packageName ?: continue
-            val target = CaptureTarget(pkg, primaryProfile.userSerialNumber)
-            val label = runCatching { pm.getApplicationLabel(appInfo).toString() }.getOrDefault(pkg)
-            val isAllowedByFlag = runCatching {
-                val m = ApplicationInfo::class.java.getMethod("isAudioPlaybackCaptureAllowed")
-                (m.invoke(appInfo) as? Boolean) ?: true
-            }.getOrDefault(true)
-            val isRestricted = !isAllowedByFlag
-            val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 &&
-                (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
-            val siblings = runCatching { pm.getPackagesForUid(appInfo.uid)?.toList().orEmpty() }.getOrDefault(emptyList())
-
-            val entry = TargetAppEntry(
-                target = target,
-                appLabel = label,
-                profileType = primaryProfile.profileType,
-                profileLabel = primaryProfile.label,
-                isInstalled = true,
-                isProfileRunning = true,
-                isSystemApp = isSystem,
-                resolvedUid = appInfo.uid,
-                sharedUidPackages = siblings,
-                isCaptureRestrictedByManifest = isRestricted,
-                statusReason = if (isRestricted) "系统禁采 (allowAudioPlaybackCapture=false)" else null
-            )
-            if (seenSearchableKeys.add(target.toStorageKey())) {
-                searchableApps.add(entry)
-            }
-            if (target in importedTargets && seenCatalogKeys.add(target.toStorageKey())) {
-                catalogApps.add(entry)
-            }
-        }
-
-        // Ensure any imported target across any profile is included without duplication
-        val profileBySerial = profiles.associateBy { it.userSerialNumber }
-        for (imported in importedTargets) {
-            if (!seenCatalogKeys.add(imported.toStorageKey())) continue
-            val profile = profileBySerial[imported.userSerialNumber]
-            catalogApps.add(
-                TargetAppEntry(
-                    target = imported,
-                    appLabel = imported.packageName.substringAfterLast('.').replaceFirstChar { it.uppercase() },
-                    profileType = profile?.profileType ?: ProfileType.OTHER,
-                    profileLabel = profile?.label ?: "空间 #${imported.userSerialNumber}",
-                    isInstalled = true,
-                    isProfileRunning = profile?.isRunning ?: true,
-                    isSystemApp = false,
-                    resolvedUid = null,
-                    sharedUidPackages = emptyList(),
-                    isCaptureRestrictedByManifest = false,
-                    statusReason = null
-                )
-            )
-        }
-
-        return MultiProfileCatalogSnapshot(
-            profiles = profiles,
-            catalogApps = catalogApps.sortedWith(compareBy({ it.profileType.ordinal }, { it.appLabel.lowercase() })),
-            searchableApps = searchableApps.sortedWith(compareBy({ it.isSystemApp }, { it.profileType.ordinal }, { it.appLabel.lowercase() }))
-        )
+        return PublicApiTargetResolver.queryCatalog(context, importedTargets)
     }
 }

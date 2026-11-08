@@ -3,9 +3,12 @@ package io.github.ddagunts.screencast.ui
 import android.os.Build
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -19,15 +22,21 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.CastConnected
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Speaker
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -37,11 +46,17 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -59,9 +74,12 @@ import io.github.ddagunts.screencast.cast.CastSdkSessionStatus
 import io.github.ddagunts.screencast.media.AudioPipelineTelemetry
 import io.github.ddagunts.screencast.media.AudioStreamConfig
 import io.github.ddagunts.screencast.target.CaptureTarget
+import io.github.ddagunts.screencast.target.PendingGlobalMuteRecovery
+import io.github.ddagunts.screencast.target.PhoneOutputMode
 import io.github.ddagunts.screencast.target.SessionMuteTelemetry
 import io.github.ddagunts.screencast.target.ShizukuConnectionState
 import io.github.ddagunts.screencast.target.TargetAppEntry
+import io.github.ddagunts.screencast.target.TargetPreset
 import io.github.ddagunts.screencast.target.UserProfileInfo
 import io.github.ddagunts.screencast.webrtc.WebRtcStage
 import kotlin.math.roundToInt
@@ -81,12 +99,28 @@ fun ScreenCastAudioScreen(
     profiles: List<UserProfileInfo> = emptyList(),
     selectedTargets: Set<CaptureTarget> = emptySet(),
     importedTargets: Set<CaptureTarget> = emptySet(),
+    presets: List<TargetPreset> = emptyList(),
     muteTelemetry: SessionMuteTelemetry = SessionMuteTelemetry(),
     isTargetEditingLocked: Boolean = false,
+    showOutputModeDialog: Boolean = false,
+    isGlobalMediaMuteCompatible: Boolean = true,
+    globalMediaMuteDisabledReason: String? = null,
+    pendingGlobalMuteRecovery: PendingGlobalMuteRecovery? = null,
     onToggleTarget: (CaptureTarget) -> Unit = {},
     onClearTargets: () -> Unit = {},
     onImportTargetApp: (packageName: String, userSerialNumber: Long) -> Unit = { _, _ -> },
     onRemoveImportedTarget: (CaptureTarget) -> Unit = {},
+    onSavePreset: (String) -> Result<TargetPreset> = {
+        Result.failure(IllegalStateException("Not wired"))
+    },
+    onApplyPreset: (String) -> Unit = {},
+    onDeletePreset: (String) -> Unit = {},
+    onSpeakerVolumeCommitted: (Float) -> Unit = {},
+    onSpeakerMuteToggled: (Boolean) -> Unit = {},
+    onSelectFallbackOutputMode: (PhoneOutputMode) -> Unit = {},
+    onDismissOutputModeDialog: () -> Unit = {},
+    onConfirmRestoreLeftoverVolume: () -> Unit = {},
+    onKeepCurrentVolumeOnRecovery: () -> Unit = {},
     onRequestShizukuPermission: () -> Unit = {},
     onRefreshCatalog: () -> Unit = {}
 ) {
@@ -126,22 +160,35 @@ fun ScreenCastAudioScreen(
                     )
                 }
 
-                // 2. Unified Target Apps Card
+                // 2. Standalone Cast Speaker Volume & Mute Control Card
+                item {
+                    CastSpeakerControlCard(
+                        castStatus = castStatus,
+                        onSpeakerVolumeCommitted = onSpeakerVolumeCommitted,
+                        onSpeakerMuteToggled = onSpeakerMuteToggled
+                    )
+                }
+
+                // 3. Unified Target Apps Card with Embedded TargetPreset Bar
                 item {
                     TargetAppSelectorCard(
                         catalogApps = catalogApps,
                         selectedTargets = selectedTargets,
                         importedTargets = importedTargets,
+                        presets = presets,
                         isEditingLocked = isTargetEditingLocked,
                         onToggleTarget = onToggleTarget,
                         onClearTargets = onClearTargets,
                         onOpenImportDialog = { showAppPickerSheet = true },
                         onRemoveImportedTarget = onRemoveImportedTarget,
+                        onSavePreset = onSavePreset,
+                        onApplyPreset = onApplyPreset,
+                        onDeletePreset = onDeletePreset,
                         onRefreshCatalog = onRefreshCatalog
                     )
                 }
 
-                // 3. Collapsible Gate Verification & Live Diagnostics Card
+                // 4. Collapsible Gate Verification & Live Diagnostics Card
                 item {
                     CollapsibleDiagnosticsCard(
                         telemetry = telemetry,
@@ -168,8 +215,28 @@ fun ScreenCastAudioScreen(
             }
         )
     }
+
+    if (showOutputModeDialog) {
+        FallbackOutputModeSelectionDialog(
+            shizukuState = muteTelemetry.shizukuState,
+            isGlobalMediaMuteCompatible = isGlobalMediaMuteCompatible,
+            globalMediaMuteDisabledReason = globalMediaMuteDisabledReason,
+            onRequestShizukuPermission = onRequestShizukuPermission,
+            onSelectMode = onSelectFallbackOutputMode,
+            onDismiss = onDismissOutputModeDialog
+        )
+    }
+
+    if (pendingGlobalMuteRecovery != null) {
+        LeftoverGlobalMuteRecoveryDialog(
+            recovery = pendingGlobalMuteRecovery,
+            onRestoreOriginal = onConfirmRestoreLeftoverVolume,
+            onKeepCurrent = onKeepCurrentVolumeOnRecovery
+        )
+    }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun WebRtcConsoleHeaderCard(
     config: AudioStreamConfig,
@@ -183,6 +250,14 @@ private fun WebRtcConsoleHeaderCard(
     onStartCastClicked: () -> Unit,
     onStopCastClicked: () -> Unit
 ) {
+    val effectiveMode = if (telemetry.isSessionActive || isRequestingCapture) {
+        telemetry.activeOutputMode
+    } else if (muteTelemetry.shizukuState == ShizukuConnectionState.READY) {
+        PhoneOutputMode.SHIZUKU_SESSION_MUTE
+    } else {
+        telemetry.activeOutputMode
+    }
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -191,7 +266,7 @@ private fun WebRtcConsoleHeaderCard(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Column {
-            // Top Visual Hero Banner with Stage Pill & Receiver ID
+            // Top Visual Hero Banner with Stage Pill & Mode/Receiver Badge
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -246,11 +321,18 @@ private fun WebRtcConsoleHeaderCard(
                     }
 
                     Surface(
-                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f),
-                        shape = RoundedCornerShape(50)
+                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.86f),
+                        shape = RoundedCornerShape(50),
+                        modifier = Modifier.testTag("active_output_mode_badge")
                     ) {
                         Text(
-                            text = "${config.sampleRateHz / 1000}kHz PCM16 • ID ${config.receiverAppId}",
+                            text = buildString {
+                                append(effectiveMode.badgeLabel)
+                                if (telemetry.isSessionActive || isRequestingCapture) {
+                                    append(" (已冻结)")
+                                }
+                                append(" • ${config.sampleRateHz / 1000}kHz")
+                            },
                             style = MaterialTheme.typography.labelSmall,
                             fontFamily = FontFamily.Monospace,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -304,7 +386,7 @@ private fun WebRtcConsoleHeaderCard(
                                         "需要 Android 10 (API 29) 及以上版本支持"
                                     castStatus.error != null -> castStatus.error
                                     telemetry.webRtcStage == WebRtcStage.SENDING ->
-                                        "正在向音箱实时传输目标 App 音频并保持本地静音"
+                                        "输出模式：${telemetry.activeOutputMode.badgeLabel} • ${telemetry.activeOutputMode.shortDescription}"
                                     telemetry.webRtcStage == WebRtcStage.CLEANUP_TIMEOUT ->
                                         "底层音频清理超时，当前进程已锁定采集，请重启应用"
                                     castStatus.isConnected ->
@@ -345,7 +427,42 @@ private fun WebRtcConsoleHeaderCard(
                     }
                 }
 
-                // Live Audio Level Meter Bar
+                // 4-Dimensional Independent Status Pills:
+                // 1) 音箱已连接, 2) 流正在发送, 3) 已有有效音频, 4) 手机已静音
+                FlowRow(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("status_four_dimensions_row"),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    StatusDimensionPill(
+                        label = if (castStatus.isConnected) "音箱已连接" else "音箱未连接",
+                        active = castStatus.isConnected,
+                        testTag = "status_pill_speaker_connected"
+                    )
+                    StatusDimensionPill(
+                        label = if (telemetry.isStreaming) "流正在发送" else "流未发送",
+                        active = telemetry.isStreaming,
+                        testTag = "status_pill_stream_sending"
+                    )
+                    StatusDimensionPill(
+                        label = if (telemetry.hasValidAudioSignal) "已有有效音频" else "尚无有效音频",
+                        active = telemetry.hasValidAudioSignal,
+                        testTag = "status_pill_valid_audio"
+                    )
+                    StatusDimensionPill(
+                        label = if (telemetry.isPhoneMuted) {
+                            "手机已静音 (${telemetry.activeOutputMode.badgeLabel})"
+                        } else {
+                            "手机未静音"
+                        },
+                        active = telemetry.isPhoneMuted,
+                        testTag = "status_pill_phone_muted"
+                    )
+                }
+
+                // Live Audio Level Meter Bar + Non-dogmatic Zero-Level Explanation
                 val normalizedLevel = ((telemetry.currentRmsDb + 60f) / 60f).coerceIn(0f, 1f)
                 Surface(
                     shape = RoundedCornerShape(12.dp),
@@ -390,17 +507,25 @@ private fun WebRtcConsoleHeaderCard(
                                 .fillMaxWidth()
                                 .height(6.dp)
                                 .clip(RoundedCornerShape(3.dp)),
-                            color = if (telemetry.isStreaming) {
+                            color = if (telemetry.hasValidAudioSignal) {
                                 MaterialTheme.colorScheme.tertiary
                             } else {
                                 MaterialTheme.colorScheme.primary
                             },
                             trackColor = MaterialTheme.colorScheme.surfaceVariant
                         )
+                        if (telemetry.isSessionActive && !telemetry.hasValidAudioSignal) {
+                            Text(
+                                text = "当前尚无有效音频信号 (-60 dBFS)：可能目标应用尚未播放、处于暂停/静音，或受应用自身回采策略影响。",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.testTag("zero_audio_level_hint")
+                            )
+                        }
                     }
                 }
 
-                // Compact Shizuku Shell Status Bar
+                // Compact Shizuku Shell & Output Mode Status Bar
                 Surface(
                     shape = RoundedCornerShape(12.dp),
                     color = when (muteTelemetry.shizukuState) {
@@ -410,7 +535,7 @@ private fun WebRtcConsoleHeaderCard(
                         ShizukuConnectionState.CONNECTING ->
                             MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
                         else ->
-                            MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.45f)
+                            MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f)
                     },
                     modifier = Modifier
                         .fillMaxWidth()
@@ -438,12 +563,20 @@ private fun WebRtcConsoleHeaderCard(
                             )
                             Column {
                                 Text(
-                                    text = muteTelemetry.shizukuState.statusLabel,
+                                    text = if (muteTelemetry.shizukuState == ShizukuConnectionState.READY) {
+                                        "${muteTelemetry.shizukuState.statusLabel} • 默认定向静音"
+                                    } else {
+                                        "${muteTelemetry.shizukuState.statusLabel} • 启动时可选备选输出模式"
+                                    },
                                     style = MaterialTheme.typography.labelMedium,
                                     fontWeight = FontWeight.SemiBold
                                 )
                                 Text(
-                                    text = "Shizuku 13.1.5 会话级零增益包络 • 3s 租约 / 1s 续期 • getMutedBy() 确认",
+                                    text = if (muteTelemetry.shizukuState == ShizukuConnectionState.READY) {
+                                        "Shizuku 会话级零增益包络 • 3s 租约 / 1s 续期 • 专属 ID 终止恢复"
+                                    } else {
+                                        "无 Shizuku 时支持公开 API 可验证空间采集，启动弹窗可选整体媒体静音或仅采集不静音"
+                                    },
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -549,4 +682,414 @@ private fun WebRtcConsoleHeaderCard(
             }
         }
     }
+}
+
+@Composable
+private fun StatusDimensionPill(
+    label: String,
+    active: Boolean,
+    testTag: String
+) {
+    Surface(
+        shape = RoundedCornerShape(50),
+        color = if (active) {
+            MaterialTheme.colorScheme.tertiary.copy(alpha = 0.2f)
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+        },
+        modifier = Modifier.testTag(testTag)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(6.dp)
+                    .clip(CircleShape)
+                    .background(
+                        if (active) MaterialTheme.colorScheme.tertiary
+                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                    )
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (active) {
+                    MaterialTheme.colorScheme.onSurface
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                }
+            )
+        }
+    }
+}
+
+/**
+ * Standalone card for controlling the connected Cast receiver's device volume (0–100%)
+ * and independent mute state via official CastSession APIs.
+ * Slider commits volume on release (`onValueChangeFinished`) and never auto-unmutes the speaker.
+ */
+@Composable
+fun CastSpeakerControlCard(
+    castStatus: CastSdkSessionStatus,
+    onSpeakerVolumeCommitted: (Float) -> Unit,
+    onSpeakerMuteToggled: (Boolean) -> Unit
+) {
+    val controlsEnabled = castStatus.isConnected && castStatus.isVolumeControlAvailable
+    var sliderDraft by remember { mutableFloatStateOf(castStatus.volume.toFloat().coerceIn(0f, 1f)) }
+    var isDragging by remember { mutableStateOf(false) }
+
+    LaunchedEffect(castStatus.volume, castStatus.isConnected, isDragging) {
+        if (!isDragging) {
+            sliderDraft = castStatus.volume.toFloat().coerceIn(0f, 1f)
+        }
+    }
+
+    val displayPercent = (sliderDraft * 100f).roundToInt().coerceIn(0, 100)
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("cast_speaker_control_card"),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f),
+                        modifier = Modifier.size(38.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.Filled.Speaker,
+                                contentDescription = "音箱音量与静音控制",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                    Column {
+                        Text(
+                            text = "音箱音量与静音控制",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = if (controlsEnabled) {
+                                "${castStatus.deviceName.ifBlank { "已连接音箱" }} • 仅调节远端 Cast 设备，不改手机音量"
+                            } else {
+                                "连接 Cast 音箱后可调节 0–100% 音量与独立静音"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                // Independent Speaker Mute Switch
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = if (castStatus.isMuted) {
+                            Icons.AutoMirrored.Filled.VolumeOff
+                        } else {
+                            Icons.AutoMirrored.Filled.VolumeUp
+                        },
+                        contentDescription = if (castStatus.isMuted) "音箱已静音" else "音箱未静音",
+                        tint = if (castStatus.isMuted) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.primary
+                        },
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = if (castStatus.isMuted) "音箱静音" else "静音开关",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Switch(
+                        checked = castStatus.isMuted,
+                        onCheckedChange = { muted -> onSpeakerMuteToggled(muted) },
+                        enabled = controlsEnabled,
+                        modifier = Modifier.testTag("speaker_mute_switch")
+                    )
+                }
+            }
+
+            // 0-100% Volume Slider (commits on release)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "$displayPercent%",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    color = if (controlsEnabled) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    modifier = Modifier
+                        .width(46.dp)
+                        .testTag("speaker_volume_percent_text")
+                )
+                Slider(
+                    value = sliderDraft,
+                    onValueChange = { newVal ->
+                        isDragging = true
+                        sliderDraft = newVal.coerceIn(0f, 1f)
+                    },
+                    onValueChangeFinished = {
+                        isDragging = false
+                        onSpeakerVolumeCommitted(sliderDraft.coerceIn(0f, 1f))
+                    },
+                    valueRange = 0f..1f,
+                    enabled = controlsEnabled,
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("speaker_volume_slider")
+                )
+            }
+
+            castStatus.volumeControlError?.let { ctrlErr ->
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.45f),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = ctrlErr,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier
+                            .padding(8.dp)
+                            .testTag("speaker_volume_error_text")
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FallbackOutputModeSelectionDialog(
+    shizukuState: ShizukuConnectionState,
+    isGlobalMediaMuteCompatible: Boolean,
+    globalMediaMuteDisabledReason: String?,
+    onRequestShizukuPermission: () -> Unit,
+    onSelectMode: (PhoneOutputMode) -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        modifier = Modifier.testTag("fallback_output_mode_dialog"),
+        title = {
+            Text(
+                text = "选择手机端声音输出模式",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .testTag("fallback_output_mode_dialog_scroll"),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "当前 ${shizukuState.statusLabel}，无法启用 Shizuku 会话级定向静音。请选择本次投音的备选模式（模式将在启动时冻结，投放期间不自动切换）：",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                // Option 1: Global Media Mute
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = if (isGlobalMediaMuteCompatible) {
+                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.38f)
+                    } else {
+                        MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.25f)
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(
+                            width = 1.dp,
+                            color = if (isGlobalMediaMuteCompatible) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.error
+                            },
+                            shape = RoundedCornerShape(12.dp)
+                        )
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = PhoneOutputMode.GLOBAL_MEDIA_MUTE.badgeLabel,
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = PhoneOutputMode.GLOBAL_MEDIA_MUTE.impactDescription,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (!isGlobalMediaMuteCompatible && globalMediaMuteDisabledReason != null) {
+                            Text(
+                                text = "已禁用：$globalMediaMuteDisabledReason",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.testTag("global_mute_incompatible_reason_text")
+                            )
+                        }
+                        Button(
+                            onClick = { onSelectMode(PhoneOutputMode.GLOBAL_MEDIA_MUTE) },
+                            enabled = isGlobalMediaMuteCompatible,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("select_mode_global_mute_button")
+                        ) {
+                            Text("以「整体媒体静音」启动")
+                        }
+                    }
+                }
+
+                // Option 2: Capture Only Unmuted
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(
+                            width = 1.dp,
+                            color = MaterialTheme.colorScheme.outlineVariant,
+                            shape = RoundedCornerShape(12.dp)
+                        )
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = PhoneOutputMode.CAPTURE_ONLY_UNMUTED.badgeLabel,
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = PhoneOutputMode.CAPTURE_ONLY_UNMUTED.impactDescription,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        OutlinedButton(
+                            onClick = { onSelectMode(PhoneOutputMode.CAPTURE_ONLY_UNMUTED) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("select_mode_capture_only_button")
+                        ) {
+                            Text("以「仅采集不静音」启动")
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    onDismiss()
+                    onRequestShizukuPermission()
+                },
+                modifier = Modifier.testTag("dialog_request_shizuku_button")
+            ) {
+                Text("去授权 / 刷新 Shizuku")
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.testTag("dismiss_output_mode_dialog_button")
+            ) {
+                Text("取消")
+            }
+        }
+    )
+}
+
+@Composable
+private fun LeftoverGlobalMuteRecoveryDialog(
+    recovery: PendingGlobalMuteRecovery,
+    onRestoreOriginal: () -> Unit,
+    onKeepCurrent: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = {},
+        modifier = Modifier.testTag("leftover_volume_recovery_dialog"),
+        title = {
+            Text(
+                text = "检测到未恢复的整体媒体静音记录",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "上次使用「整体媒体静音」投音期间应用异常终止，为避免擅自覆盖您当前的音量设置，请选择处理方式：",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = "• 投音前记录的原媒体音量：${recovery.savedVolume} / ${recovery.maxVolume}" +
+                        if (recovery.wasMuted) " (原为静音)" else "",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontFamily = FontFamily.Monospace
+                )
+                Text(
+                    text = "• 当前系统媒体音量：${recovery.currentVolume} / ${recovery.maxVolume}",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onRestoreOriginal,
+                modifier = Modifier.testTag("restore_leftover_volume_button")
+            ) {
+                Text("恢复原音量 (${recovery.savedVolume})")
+            }
+        },
+        dismissButton = {
+            OutlinedButton(
+                onClick = onKeepCurrent,
+                modifier = Modifier.testTag("keep_current_volume_button")
+            ) {
+                Text("保留当前设置 (${recovery.currentVolume})")
+            }
+        }
+    )
 }

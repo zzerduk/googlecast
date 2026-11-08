@@ -682,7 +682,7 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         return builder.build()
     }
 
-    private fun buildDedicatedIdOnlyShaperConfig(): VolumeShaper.Configuration {
+    internal fun buildDedicatedIdOnlyShaperConfig(): VolumeShaper.Configuration {
         return try {
             val ctor = VolumeShaper.Configuration::class.java
                 .getDeclaredConstructor(Int::class.javaPrimitiveType)
@@ -713,6 +713,26 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         }
     }
 
+    internal fun buildTerminateShaperOperation(): VolumeShaper.Operation? {
+        runCatching {
+            val opBuilderClass = Class.forName("android.media.VolumeShaper\$Operation\$Builder")
+            val opBuilder = opBuilderClass.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
+            val terminateMethod = opBuilderClass.getDeclaredMethod("terminate").apply { isAccessible = true }
+            val buildMethod = opBuilderClass.getDeclaredMethod("build").apply { isAccessible = true }
+            terminateMethod.invoke(opBuilder)
+            return buildMethod.invoke(opBuilder) as VolumeShaper.Operation
+        }
+        runCatching {
+            val ctor = VolumeShaper.Operation::class.java.getDeclaredConstructor(
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Float::class.javaPrimitiveType
+            ).apply { isAccessible = true }
+            return ctor.newInstance(OPERATION_FLAG_TERMINATE, DEDICATED_SHAPER_ID, Float.NaN)
+        }
+        return null
+    }
+
     private fun applyDedicatedZeroGainShaperToPlayer(
         playerProxy: Any,
         replaceExisting: Boolean
@@ -726,11 +746,13 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         }
     }
 
-    private fun removeDedicatedShaperFromPlayer(playerProxy: Any) {
-        try {
+    internal fun removeDedicatedShaperFromPlayer(playerProxy: Any): Boolean {
+        return try {
             val idConfig = buildDedicatedIdOnlyShaperConfig()
-            invokeApplyVolumeShaper(playerProxy, idConfig, VolumeShaper.Operation.REVERSE)
+            val terminateOp = buildTerminateShaperOperation() ?: return false
+            invokeApplyVolumeShaper(playerProxy, idConfig, terminateOp)
         } catch (_: Throwable) {
+            false
         }
     }
 
@@ -1071,6 +1093,7 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
 
     companion object {
         const val DEDICATED_SHAPER_ID: Int = 0x53434D54 // "SCMT"
+        const val OPERATION_FLAG_TERMINATE: Int = 1 shl 1
         const val MAX_LEASE_DURATION_MS: Long = 3_000L
         const val MAX_CONFIRMATION_WAIT_MS: Long = 90L
         const val NEW_TRACK_GATE_LIMIT_MS: Long = 100L

@@ -24,6 +24,7 @@ import io.github.ddagunts.screencast.cast.CastSdkSessionController
 import io.github.ddagunts.screencast.cast.CastSignalingChannel
 import io.github.ddagunts.screencast.shizuku.ShizukuSessionMuteController
 import io.github.ddagunts.screencast.target.CaptureTargetRepository
+import io.github.ddagunts.screencast.target.PhoneOutputMode
 import io.github.ddagunts.screencast.webrtc.WebRtcAudioSession
 import io.github.ddagunts.screencast.webrtc.WebRtcCleanupTimeoutException
 import io.github.ddagunts.screencast.webrtc.WebRtcStage
@@ -39,6 +40,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
 
 object AudioCastSessionCoordinator {
     private val _config = MutableStateFlow(AudioStreamConfig())
@@ -49,9 +51,9 @@ object AudioCastSessionCoordinator {
 
     private val _protocolLogs = MutableStateFlow<List<String>>(
         listOf(
-            "Ready: WebRTC Per-App UID Whitelist + Shizuku VolumeShaper Session Mute active.",
+            "Ready: WebRTC Per-App UID Whitelist + Multi-Mode Phone Audio Output (Shizuku / Global Mute / Capture Only).",
             "WebRTC Cast Receiver: 9098830C (48 kHz / Stereo / PCM16).",
-            "Add and select at least one target app instance (Primary / Work / Clone) before starting."
+            "Add and select at least one target app instance before starting."
         )
     )
     val protocolLogs: StateFlow<List<String>> = _protocolLogs.asStateFlow()
@@ -73,6 +75,8 @@ object AudioCastSessionCoordinator {
                 updated.copy(
                     isStreaming = false,
                     isSessionActive = false,
+                    isPhoneMuted = false,
+                    hasValidAudioSignal = false,
                     webRtcStage = WebRtcStage.CLEANUP_TIMEOUT,
                     isCaptureLocked = true,
                     error = current.error ?: updated.error
@@ -84,15 +88,20 @@ object AudioCastSessionCoordinator {
         }
     }
 
-    fun markCleanupTimeout(message: String) {
-        // Immediate non-blocking mute restoration even when native audio HAL cleanup times out
+    fun markCleanupTimeout(message: String, appContext: Context? = null) {
+        // Immediate non-blocking restoration even when native audio HAL cleanup times out
         ShizukuSessionMuteController.stopLeaseAndRestoreImmediately()
+        if (appContext != null) {
+            PhoneGlobalMediaMuteController.restorePhoneAudioIfNeeded(appContext)
+        }
         CaptureTargetRepository.clearFrozenTargetsSnapshot()
         isCaptureLocked = true
         _telemetry.update { current ->
             current.copy(
                 isStreaming = false,
                 isSessionActive = false,
+                isPhoneMuted = false,
+                hasValidAudioSignal = false,
                 webRtcStage = WebRtcStage.CLEANUP_TIMEOUT,
                 isCaptureLocked = true,
                 error = message
@@ -101,8 +110,11 @@ object AudioCastSessionCoordinator {
         appendLog("Audio cast cleanup timed out: $message")
     }
 
-    internal fun resetForTesting() {
+    internal fun resetForTesting(appContext: Context? = null) {
         ShizukuSessionMuteController.stopLeaseAndRestoreImmediately()
+        if (appContext != null) {
+            PhoneGlobalMediaMuteController.resetForTesting(appContext)
+        }
         CaptureTargetRepository.resetForTesting()
         isCaptureLocked = false
         _config.value = AudioStreamConfig()
@@ -135,14 +147,15 @@ class AudioCastCaptureService : Service() {
     private var projectionCallback: MediaProjection.Callback? = null
     private var webRtcSession: WebRtcAudioSession? = null
     private var webRtcChannel: CastSignalingChannel? = null
+    @Volatile private var frozenSessionOutputMode: PhoneOutputMode = PhoneOutputMode.SHIZUKU_SESSION_MUTE
+    @Volatile private var isOutputModeInitialized: Boolean = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP_AUDIO_CAST -> {
-                ShizukuSessionMuteController.stopLeaseAndRestoreImmediately()
-                CaptureTargetRepository.clearFrozenTargetsSnapshot()
+                restorePhoneAudioImmediately(failureReason = null)
                 if (cleanupTimedOut || AudioCastSessionCoordinator.isCaptureLocked) {
                     return START_NOT_STICKY
                 }
@@ -153,23 +166,36 @@ class AudioCastCaptureService : Service() {
                     return START_NOT_STICKY
                 }
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+                val requestedModeName = intent.getStringExtra(EXTRA_OUTPUT_MODE)
+                val requestedMode = requestedModeName?.let { name ->
+                    runCatching { PhoneOutputMode.valueOf(name) }.getOrNull()
+                }
                 @Suppress("DEPRECATION")
                 val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
                 } else {
                     intent.getParcelableExtra(EXTRA_RESULT_DATA)
                 }
-                startCastingPipeline(resultCode, resultData)
+                startCastingPipeline(resultCode, resultData, requestedMode)
             }
             else -> {
-                ShizukuSessionMuteController.stopLeaseAndRestoreImmediately()
-                CaptureTargetRepository.clearFrozenTargetsSnapshot()
+                restorePhoneAudioImmediately(failureReason = null)
                 if (!cleanupTimedOut && !AudioCastSessionCoordinator.isCaptureLocked) {
                     stopSelf()
                 }
             }
         }
         return START_NOT_STICKY
+    }
+
+    private fun restorePhoneAudioImmediately(failureReason: String?) {
+        ShizukuSessionMuteController.stopLeaseAndRestoreImmediately(failureReason = failureReason)
+        val globalRestoreMsg = PhoneGlobalMediaMuteController.restorePhoneAudioIfNeeded(applicationContext)
+        if (globalRestoreMsg != null) {
+            AudioCastSessionCoordinator.appendLog(globalRestoreMsg)
+        }
+        isOutputModeInitialized = false
+        CaptureTargetRepository.clearFrozenTargetsSnapshot()
     }
 
     private fun promoteToForeground() {
@@ -198,10 +224,29 @@ class AudioCastCaptureService : Service() {
         }
     }
 
-    private fun startCastingPipeline(resultCode: Int, resultData: Intent?) {
+    private fun refreshForegroundNotification() {
+        if (destroyed || !sessionRunning) return
+        runCatching {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.notify(NOTIFICATION_ID, buildForegroundNotification())
+        }
+    }
+
+    private fun startCastingPipeline(
+        resultCode: Int,
+        resultData: Intent?,
+        requestedMode: PhoneOutputMode?
+    ) {
         if (AudioCastSessionCoordinator.isCaptureLocked) return
         sessionRunning = true
+        isOutputModeInitialized = false
         val token = ++generation
+
+        val frozenMode = requestedMode
+            ?: CaptureTargetRepository.frozenOutputMode.value
+            ?: PhoneOutputMode.SHIZUKU_SESSION_MUTE
+        frozenSessionOutputMode = frozenMode
+
         // Always satisfy Android 14+ foreground service start contract before any validation can throw
         runCatching { promoteToForeground() }
 
@@ -212,6 +257,7 @@ class AudioCastCaptureService : Service() {
             AudioPipelineTelemetry(
                 isSessionActive = true,
                 activeTargets = frozenTargets,
+                activeOutputMode = frozenMode,
                 webRtcStage = WebRtcStage.CAPTURING
             )
         }
@@ -232,44 +278,94 @@ class AudioCastCaptureService : Service() {
             }
 
             // Re-resolve full UIDs from the frozen target snapshot immediately before starting capture
-            val resolution = CaptureTargetRepository.resolveAndValidateFrozenTargets(applicationContext)
+            val resolution = CaptureTargetRepository.resolveAndValidateFrozenTargets(
+                context = applicationContext,
+                outputModeOverride = frozenMode
+            )
             if (!resolution.isValid || resolution.resolvedUids.isEmpty()) {
                 error(resolution.failureReason ?: "目标应用完整 UID 解析与共享 UID 校验未通过。")
             }
             val targetUids = resolution.resolvedUids
             AudioCastSessionCoordinator.appendLog(
-                "Resolved target UIDs for capture & session mute: ${targetUids.sorted()} " +
+                "Resolved target UIDs for mode=${frozenMode.name}: ${targetUids.sorted()} " +
                     "from ${frozenTargets.map { it.toStorageKey() }}"
             )
 
-            // Acquire 3-second clock-time session mute lease and confirm initial active sessions via getMutedBy()
-            val leaseOutcome = ShizukuSessionMuteController.startSessionMuteLease(
-                targetUids = targetUids,
-                onFatalMuteError = { muteError ->
-                    serviceScope.launch(Dispatchers.Main.immediate) {
-                        if (generation == token && !stopping) {
-                            stopCastingSession(muteError)
+            // Initialize phone output mode according to the frozen mode (never auto-switches mid-session)
+            when (frozenMode) {
+                PhoneOutputMode.SHIZUKU_SESSION_MUTE -> {
+                    val leaseOutcome = ShizukuSessionMuteController.startSessionMuteLease(
+                        targetUids = targetUids,
+                        onFatalMuteError = { muteError ->
+                            serviceScope.launch(Dispatchers.Main.immediate) {
+                                if (generation == token && !stopping) {
+                                    stopCastingSession(muteError)
+                                }
+                            }
                         }
+                    )
+                    if (!leaseOutcome.success) {
+                        error(leaseOutcome.error ?: "初始播放器会话静音确认失败，已恢复会话并终止投放。")
                     }
+                    isOutputModeInitialized = true
+                    AudioCastSessionCoordinator.updateTelemetry {
+                        it.copy(
+                            activeTargets = frozenTargets,
+                            activeTargetUids = targetUids,
+                            activeOutputMode = frozenMode,
+                            isInitialMuteConfirmed = true,
+                            isPhoneMuted = true
+                        )
+                    }
+                    AudioCastSessionCoordinator.appendLog(
+                        "Shizuku session mute confirmed via getMutedBy() " +
+                            "(active=${leaseOutcome.activeTargetPlayerCount}, " +
+                            "muted=${leaseOutcome.confirmedMutedPlayerCount}, " +
+                            "mask=0x${leaseOutcome.lastMixerMutedByMask.toString(16)})"
+                    )
                 }
-            )
-            if (!leaseOutcome.success) {
-                error(leaseOutcome.error ?: "初始播放器会话静音确认失败，已恢复会话并终止投放。")
+
+                PhoneOutputMode.GLOBAL_MEDIA_MUTE -> {
+                    val engageResult = PhoneGlobalMediaMuteController.engageGlobalMediaMute(applicationContext)
+                    if (engageResult.isFailure) {
+                        error(
+                            engageResult.exceptionOrNull()?.message
+                                ?: "整体媒体静音执行失败，已回滚原媒体音量并终止投放。"
+                        )
+                    }
+                    isOutputModeInitialized = true
+                    AudioCastSessionCoordinator.updateTelemetry {
+                        it.copy(
+                            activeTargets = frozenTargets,
+                            activeTargetUids = targetUids,
+                            activeOutputMode = frozenMode,
+                            isInitialMuteConfirmed = false,
+                            isPhoneMuted = true
+                        )
+                    }
+                    AudioCastSessionCoordinator.appendLog(
+                        "Global media mute engaged: original STREAM_MUSIC volume persisted and set to 0."
+                    )
+                }
+
+                PhoneOutputMode.CAPTURE_ONLY_UNMUTED -> {
+                    isOutputModeInitialized = true
+                    AudioCastSessionCoordinator.updateTelemetry {
+                        it.copy(
+                            activeTargets = frozenTargets,
+                            activeTargetUids = targetUids,
+                            activeOutputMode = frozenMode,
+                            isInitialMuteConfirmed = false,
+                            isPhoneMuted = false
+                        )
+                    }
+                    AudioCastSessionCoordinator.appendLog(
+                        "Capture-only (unmuted) mode active: phone volume and sessions left untouched."
+                    )
+                }
             }
 
-            AudioCastSessionCoordinator.updateTelemetry {
-                it.copy(
-                    activeTargets = frozenTargets,
-                    activeTargetUids = targetUids,
-                    isInitialMuteConfirmed = true
-                )
-            }
-            AudioCastSessionCoordinator.appendLog(
-                "Initial session mute confirmed via getMutedBy() " +
-                    "(active=${leaseOutcome.activeTargetPlayerCount}, " +
-                    "muted=${leaseOutcome.confirmedMutedPlayerCount}, " +
-                    "mask=0x${leaseOutcome.lastMixerMutedByMask.toString(16)})"
-            )
+            refreshForegroundNotification()
 
             val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             val projection = manager.getMediaProjection(resultCode, resultData)
@@ -290,6 +386,18 @@ class AudioCastCaptureService : Service() {
         }
     }
 
+    private fun computeCurrentPhoneMutedState(): Boolean {
+        return when (frozenSessionOutputMode) {
+            PhoneOutputMode.SHIZUKU_SESSION_MUTE ->
+                AudioCastSessionCoordinator.telemetry.value.isInitialMuteConfirmed &&
+                    ShizukuSessionMuteController.muteTelemetry.value.leaseActive
+            PhoneOutputMode.GLOBAL_MEDIA_MUTE ->
+                PhoneGlobalMediaMuteController.isPhoneCurrentlyMutedByGlobalMode(applicationContext)
+            PhoneOutputMode.CAPTURE_ONLY_UNMUTED ->
+                false
+        }
+    }
+
     private fun startWebRtcPipeline(
         projection: MediaProjection,
         targetUids: Set<Int>,
@@ -303,21 +411,26 @@ class AudioCastCaptureService : Service() {
             onStage = { stage ->
                 if (stage == WebRtcStage.CLEANUP_TIMEOUT) {
                     AudioCastSessionCoordinator.markCleanupTimeout(
-                        AudioCastSessionCoordinator.telemetry.value.error
-                            ?: "WebRTC native audio cleanup timed out; capture is locked in this process."
+                        message = AudioCastSessionCoordinator.telemetry.value.error
+                            ?: "WebRTC native audio cleanup timed out; capture is locked in this process.",
+                        appContext = applicationContext
                     )
                 } else if (generation == token && !stopping) {
-                    val muteReady = AudioCastSessionCoordinator.telemetry.value.isInitialMuteConfirmed
+                    val modeReady = isOutputModeInitialized
+                    val phoneMuted = computeCurrentPhoneMutedState()
                     AudioCastSessionCoordinator.updateTelemetry {
                         it.copy(
                             webRtcStage = stage,
-                            isStreaming = muteReady && stage == WebRtcStage.SENDING,
+                            activeOutputMode = frozenSessionOutputMode,
+                            isStreaming = modeReady && stage == WebRtcStage.SENDING,
+                            isPhoneMuted = phoneMuted,
                             isHardwareCaptureActive = stage == WebRtcStage.CAPTURING ||
                                 stage == WebRtcStage.NEGOTIATING ||
                                 stage == WebRtcStage.CONNECTED ||
                                 stage == WebRtcStage.SENDING
                         )
                     }
+                    refreshForegroundNotification()
                 }
             },
             onStats = { stats ->
@@ -334,6 +447,10 @@ class AudioCastCaptureService : Service() {
             onPcmStats = { stats ->
                 if (generation == token && !stopping) {
                     ShizukuSessionMuteController.recordAudioRmsForGateComparison(stats.rmsDb)
+                    val hasValidSignal = stats.rmsDb > -59.5f
+                    val phoneMuted = computeCurrentPhoneMutedState()
+                    val previousSignal = AudioCastSessionCoordinator.telemetry.value.hasValidAudioSignal
+                    val previousMuted = AudioCastSessionCoordinator.telemetry.value.isPhoneMuted
                     AudioCastSessionCoordinator.updateTelemetry {
                         it.copy(
                             pcmChunksRead = stats.chunksRead,
@@ -341,8 +458,13 @@ class AudioCastCaptureService : Service() {
                             pcmDroppedChunks = stats.droppedChunks,
                             pcmRingDepth = stats.ringDepth,
                             audioRecordMinBufferBytes = stats.minBufferBytes,
-                            currentRmsDb = stats.rmsDb
+                            currentRmsDb = stats.rmsDb,
+                            hasValidAudioSignal = hasValidSignal,
+                            isPhoneMuted = phoneMuted
                         )
+                    }
+                    if (hasValidSignal != previousSignal || phoneMuted != previousMuted) {
+                        refreshForegroundNotification()
                     }
                 }
             },
@@ -385,9 +507,9 @@ class AudioCastCaptureService : Service() {
     }
 
     private fun stopCastingSession(error: String? = null) {
-        // CRITICAL: Immediately cancel lease renewal and restore all muted sessions BEFORE waiting on native HAL
-        ShizukuSessionMuteController.stopLeaseAndRestoreImmediately(failureReason = error)
-        CaptureTargetRepository.clearFrozenTargetsSnapshot()
+        // CRITICAL: Immediately restore phone audio (Shizuku session shaper or Global Media Mute)
+        // BEFORE waiting on native WebRTC HAL cleanup!
+        restorePhoneAudioImmediately(failureReason = error)
 
         if (stopping || cleanupTimedOut) return
         if (!sessionRunning) {
@@ -414,6 +536,8 @@ class AudioCastCaptureService : Service() {
         AudioCastSessionCoordinator.updateTelemetry {
             it.copy(
                 isStreaming = false,
+                isPhoneMuted = false,
+                hasValidAudioSignal = false,
                 webRtcStage = WebRtcStage.STOPPING,
                 error = error ?: it.error
             )
@@ -457,7 +581,7 @@ class AudioCastCaptureService : Service() {
                     stopping = false
                     val timeoutMessage = finalError
                         ?: "WebRTC native audio cleanup timed out; capture is locked in this process."
-                    AudioCastSessionCoordinator.markCleanupTimeout(timeoutMessage)
+                    AudioCastSessionCoordinator.markCleanupTimeout(timeoutMessage, applicationContext)
                     if (!destroyed) {
                         val nm = getSystemService(NotificationManager::class.java)
                         nm?.notify(
@@ -486,13 +610,14 @@ class AudioCastCaptureService : Service() {
                     }
                     AudioCastSessionCoordinator.updateTelemetry {
                         AudioPipelineTelemetry(
+                            activeOutputMode = frozenSessionOutputMode,
                             webRtcStage = if (finalError != null) WebRtcStage.ERROR else WebRtcStage.IDLE,
                             error = finalError
                         )
                     }
                     AudioCastSessionCoordinator.appendLog(
-                        if (finalError == null) "Audio cast session stopped and session mute envelope removed."
-                        else "Audio cast stopped with error ($finalError); session mute envelope removed."
+                        if (finalError == null) "Audio cast session stopped and phone audio restored."
+                        else "Audio cast stopped with error ($finalError); phone audio restored."
                     )
                 }
                 if (destroyed) teardownScope.cancel()
@@ -502,8 +627,7 @@ class AudioCastCaptureService : Service() {
 
     override fun onDestroy() {
         destroyed = true
-        ShizukuSessionMuteController.stopLeaseAndRestoreImmediately()
-        CaptureTargetRepository.clearFrozenTargetsSnapshot()
+        restorePhoneAudioImmediately(failureReason = null)
         stopCastingSession()
         serviceScope.cancel()
         if (stopJob?.isActive != true) teardownScope.cancel()
@@ -522,7 +646,7 @@ class AudioCastCaptureService : Service() {
         }
     }
 
-    private fun buildForegroundNotification(
+    internal fun buildForegroundNotification(
         isCleanupTimedOut: Boolean = false,
         timeoutMessage: String? = null
     ): Notification {
@@ -534,20 +658,40 @@ class AudioCastCaptureService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        val tel = AudioCastSessionCoordinator.telemetry.value
+        val castConnected = CastSdkSessionController.status.value.isConnected
+        val mode = tel.activeOutputMode
+
+        val titleText = if (isCleanupTimedOut) {
+            "Audio Cleanup Timed Out (Capture Locked)"
+        } else {
+            "ScreenCast 投音 • ${mode.badgeLabel}"
+        }
+
+        val bodyText = if (isCleanupTimedOut) {
+            timeoutMessage
+                ?: "Native audio cleanup did not finish; restart the app before capturing again."
+        } else {
+            val speakerPart = if (castConnected) "音箱已连接" else "音箱未连接"
+            val streamPart = if (tel.isStreaming) "流正在发送" else "阶段:${tel.webRtcStage.name}"
+            val audioPart = if (tel.hasValidAudioSignal) {
+                "有效音频 (${tel.currentRmsDb.roundToInt()} dBFS)"
+            } else {
+                "尚无有效音频"
+            }
+            val mutePart = if (tel.isPhoneMuted) {
+                "手机已静音 (${mode.badgeLabel})"
+            } else {
+                "手机未静音 (${mode.badgeLabel})"
+            }
+            "$speakerPart • $streamPart • $audioPart • $mutePart"
+        }
+
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle(
-                if (isCleanupTimedOut) "Audio Cleanup Timed Out (Capture Locked)"
-                else getString(R.string.notification_title)
-            )
-            .setContentText(
-                if (isCleanupTimedOut) {
-                    timeoutMessage
-                        ?: "Native audio cleanup did not finish; restart the app before capturing again."
-                } else {
-                    "WebRTC per-UID capture + Shizuku session mute active"
-                }
-            )
+            .setContentTitle(titleText)
+            .setContentText(bodyText)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(bodyText))
             .setContentIntent(pendingOpen)
             .setOngoing(true)
 
@@ -575,6 +719,7 @@ class AudioCastCaptureService : Service() {
         const val ACTION_STOP_AUDIO_CAST = "io.github.ddagunts.screencast.action.STOP_AUDIO_CAST"
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"
+        const val EXTRA_OUTPUT_MODE = "extra_output_mode"
 
         private const val CHANNEL_ID = "screencast_audio_low_latency"
         private const val NOTIFICATION_ID = 8009

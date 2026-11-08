@@ -52,8 +52,14 @@ class MainActivity : FragmentActivity() {
                 val profiles by viewModel.profiles.collectAsStateWithLifecycle()
                 val selectedTargets by viewModel.selectedTargets.collectAsStateWithLifecycle()
                 val importedTargets by viewModel.importedTargets.collectAsStateWithLifecycle()
+                val presets by viewModel.presets.collectAsStateWithLifecycle()
                 val muteTelemetry by viewModel.muteTelemetry.collectAsStateWithLifecycle()
                 val isTargetEditingLocked by viewModel.isTargetEditingLocked.collectAsStateWithLifecycle()
+
+                val showOutputModeDialog by viewModel.showOutputModeDialog.collectAsStateWithLifecycle()
+                val isGlobalMediaMuteCompatible by viewModel.isGlobalMediaMuteCompatible.collectAsStateWithLifecycle()
+                val globalMediaMuteDisabledReason by viewModel.globalMediaMuteDisabledReason.collectAsStateWithLifecycle()
+                val pendingGlobalMuteRecovery by viewModel.pendingGlobalMuteRecovery.collectAsStateWithLifecycle()
 
                 val mediaProjectionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.StartActivityForResult()
@@ -102,6 +108,36 @@ class MainActivity : FragmentActivity() {
                     }
                 }
 
+                val launchPermissionsAndProjectionIfPrepared = {
+                    val missingPermissions = buildList {
+                        if (ContextCompat.checkSelfPermission(
+                                this@MainActivity, Manifest.permission.RECORD_AUDIO
+                            ) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            add(Manifest.permission.RECORD_AUDIO)
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                            ContextCompat.checkSelfPermission(
+                                this@MainActivity, Manifest.permission.POST_NOTIFICATIONS
+                            ) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            add(Manifest.permission.POST_NOTIFICATIONS)
+                        }
+                    }
+
+                    if (missingPermissions.isNotEmpty()) {
+                        try {
+                            permissionLauncher.launch(missingPermissions.toTypedArray())
+                        } catch (e: Exception) {
+                            viewModel.captureAuthorizationFailed(
+                                e.message ?: "Unable to request required audio permissions."
+                            )
+                        }
+                    } else {
+                        requestProjectionConsent()
+                    }
+                }
+
                 ScreenCastAudioScreen(
                     config = config,
                     telemetry = telemetry,
@@ -127,34 +163,8 @@ class MainActivity : FragmentActivity() {
                         }
                     },
                     onStartCastClicked = {
-                        if (viewModel.prepareCaptureRequest()) {
-                            val missingPermissions = buildList {
-                                if (ContextCompat.checkSelfPermission(
-                                        this@MainActivity, Manifest.permission.RECORD_AUDIO
-                                    ) != PackageManager.PERMISSION_GRANTED
-                                ) {
-                                    add(Manifest.permission.RECORD_AUDIO)
-                                }
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                                    ContextCompat.checkSelfPermission(
-                                        this@MainActivity, Manifest.permission.POST_NOTIFICATIONS
-                                    ) != PackageManager.PERMISSION_GRANTED
-                                ) {
-                                    add(Manifest.permission.POST_NOTIFICATIONS)
-                                }
-                            }
-
-                            if (missingPermissions.isNotEmpty()) {
-                                try {
-                                    permissionLauncher.launch(missingPermissions.toTypedArray())
-                                } catch (e: Exception) {
-                                    viewModel.captureAuthorizationFailed(
-                                        e.message ?: "Unable to request required audio permissions."
-                                    )
-                                }
-                            } else {
-                                requestProjectionConsent()
-                            }
+                        if (viewModel.initiateStartCastFlow()) {
+                            launchPermissionsAndProjectionIfPrepared()
                         }
                     },
                     onStopCastClicked = { viewModel.stopAudioCast() },
@@ -163,12 +173,30 @@ class MainActivity : FragmentActivity() {
                     profiles = profiles,
                     selectedTargets = selectedTargets,
                     importedTargets = importedTargets,
+                    presets = presets,
                     muteTelemetry = muteTelemetry,
                     isTargetEditingLocked = isTargetEditingLocked,
+                    showOutputModeDialog = showOutputModeDialog,
+                    isGlobalMediaMuteCompatible = isGlobalMediaMuteCompatible,
+                    globalMediaMuteDisabledReason = globalMediaMuteDisabledReason,
+                    pendingGlobalMuteRecovery = pendingGlobalMuteRecovery,
                     onToggleTarget = viewModel::toggleTargetAppSelection,
                     onClearTargets = viewModel::clearTargetAppSelections,
                     onImportTargetApp = { pkg, serial -> viewModel.importTargetApp(pkg, serial) },
                     onRemoveImportedTarget = viewModel::removeImportedTarget,
+                    onSavePreset = viewModel::saveCurrentSelectionAsPreset,
+                    onApplyPreset = { name -> viewModel.applyTargetPreset(name) },
+                    onDeletePreset = { name -> viewModel.deleteTargetPreset(name) },
+                    onSpeakerVolumeCommitted = { vol -> viewModel.setSpeakerVolume(vol) },
+                    onSpeakerMuteToggled = { muted -> viewModel.setSpeakerMuted(muted) },
+                    onSelectFallbackOutputMode = { chosenMode ->
+                        if (viewModel.confirmFallbackOutputModeAndPrepare(chosenMode)) {
+                            launchPermissionsAndProjectionIfPrepared()
+                        }
+                    },
+                    onDismissOutputModeDialog = viewModel::dismissOutputModeDialog,
+                    onConfirmRestoreLeftoverVolume = viewModel::confirmRestoreLeftoverMediaVolume,
+                    onKeepCurrentVolumeOnRecovery = viewModel::dismissLeftoverMediaVolumeRecovery,
                     onRequestShizukuPermission = viewModel::requestShizukuPermission,
                     onRefreshCatalog = viewModel::refreshTargetCatalog
                 )

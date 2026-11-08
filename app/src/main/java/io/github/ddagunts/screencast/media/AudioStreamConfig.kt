@@ -1,6 +1,7 @@
 package io.github.ddagunts.screencast.media
 
 import io.github.ddagunts.screencast.target.CaptureTarget
+import io.github.ddagunts.screencast.target.PhoneOutputMode
 import io.github.ddagunts.screencast.webrtc.WebRtcStage
 
 data class AudioStreamConfig(
@@ -25,7 +26,10 @@ data class AudioPipelineTelemetry(
     val isCaptureLocked: Boolean = false,
     val activeTargets: Set<CaptureTarget> = emptySet(),
     val activeTargetUids: Set<Int> = emptySet(),
+    val activeOutputMode: PhoneOutputMode = PhoneOutputMode.SHIZUKU_SESSION_MUTE,
     val isInitialMuteConfirmed: Boolean = false,
+    val isPhoneMuted: Boolean = false,
+    val hasValidAudioSignal: Boolean = false,
     val isHardwareCaptureActive: Boolean = false,
     val isHardwareCaptureDegraded: Boolean = false,
     val error: String? = null

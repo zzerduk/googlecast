@@ -2,6 +2,7 @@ package io.github.ddagunts.screencast.target
 
 import android.app.Application
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.media.AudioAttributes
 import android.media.AudioRecord
 import android.media.VolumeShaper
@@ -9,7 +10,6 @@ import android.media.projection.MediaProjection
 import androidx.test.core.app.ApplicationProvider
 import io.github.ddagunts.screencast.cast.CastSdkSessionController
 import io.github.ddagunts.screencast.cast.CastSessionVolumeEndpoint
-import io.github.ddagunts.screencast.cast.CastSignalingChannel
 import io.github.ddagunts.screencast.media.AudioCastSessionCoordinator
 import io.github.ddagunts.screencast.media.PhoneGlobalMediaMuteController
 import io.github.ddagunts.screencast.media.PlaybackCaptureConfigBuilder
@@ -24,9 +24,13 @@ import io.github.ddagunts.screencast.webrtc.PlaybackAudioRecorder
 import io.github.ddagunts.screencast.webrtc.WebRtcAudioCapture
 import io.github.ddagunts.screencast.webrtc.WebRtcPcmBuffer
 import io.github.ddagunts.screencast.webrtc.WebRtcStage
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runBlocking
+import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -42,7 +46,9 @@ import org.robolectric.annotation.Config
 import org.robolectric.shadow.api.Shadow
 import java.io.IOException
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 @RunWith(RobolectricTestRunner::class)
@@ -60,6 +66,7 @@ class PerAppAudioCastAndMuteTest {
         projection = Shadow.newInstanceOf(MediaProjection::class.java)
         AudioCastSessionCoordinator.resetForTesting(app)
         CastSdkSessionController.resetForTesting()
+        PublicApiTargetResolver.resetEnvironmentForTesting()
         fakeAudioAdapter = FakeSystemMediaAudioAdapter(currentVolume = 9, maxVolume = 15, currentMuted = false)
         PhoneGlobalMediaMuteController.audioAdapter = fakeAudioAdapter
         fakeBackend = FakeShizukuMuteBackend()
@@ -68,6 +75,7 @@ class PerAppAudioCastAndMuteTest {
 
     @After
     fun tearDown() {
+        PublicApiTargetResolver.resetEnvironmentForTesting()
         CastSdkSessionController.resetForTesting()
         ShizukuSessionMuteController.resetToDefaultBackend()
         AudioCastSessionCoordinator.resetForTesting(app)
@@ -186,7 +194,7 @@ class PerAppAudioCastAndMuteTest {
     }
 
     @Test
-    fun prepareCaptureRequestRejectsEmptyTargetsSharedUidConflictsAndLocksEditingWhenFrozen() {
+    fun prepareCaptureRequestRejectsEmptyTargetsSharedUidConflictsAndLocksEditingWhenFrozen() = runBlocking {
         val viewModel = ScreenCastViewModel(app)
 
         // 1. Empty target selection must be rejected
@@ -265,7 +273,6 @@ class PerAppAudioCastAndMuteTest {
         )
         assertEquals(1, fatalErrors.size)
         assertFalse(ShizukuSessionMuteController.muteTelemetry.value.leaseActive)
-        assertTrue(fakeBackend.releaseCalls.get() >= 1)
     }
 
     @Test
@@ -303,7 +310,7 @@ class PerAppAudioCastAndMuteTest {
     }
 
     @Test
-    fun fallbackModeDialogOpensWhenShizukuUnavailableOrPermissionRequiredAndFreezesSelectedMode() {
+    fun fallbackModeDialogOpensWhenShizukuUnavailableOrPermissionRequiredAndFreezesSelectedMode() = runBlocking {
         val viewModel = ScreenCastViewModel(app)
         val metrolist = CaptureTarget("com.metrolist.music", 0L)
         CaptureTargetRepository.setTargetsForTesting(setOf(metrolist))
@@ -326,9 +333,9 @@ class PerAppAudioCastAndMuteTest {
                     appLabel = "Metrolist",
                     uid = 10234,
                     isSystemApp = false,
-                    isCaptureAllowed = true,
                     isLaunchable = true,
-                    verifiedSharedUidPackages = listOf("com.metrolist.music")
+                    verifiedSharedUidPackages = listOf("com.metrolist.music"),
+                    appCategory = ApplicationInfo.CATEGORY_AUDIO
                 )
             )
         )
@@ -422,9 +429,9 @@ class PerAppAudioCastAndMuteTest {
                     appLabel = "Metrolist",
                     uid = 10234,
                     isSystemApp = false,
-                    isCaptureAllowed = true,
                     isLaunchable = true,
-                    verifiedSharedUidPackages = listOf("com.metrolist.music")
+                    verifiedSharedUidPackages = listOf("com.metrolist.music"),
+                    appCategory = ApplicationInfo.CATEGORY_AUDIO
                 ),
                 workMusicUnverifiableShared to PublicTargetEnvironment.PublicAppMetadata(
                     packageName = "com.work.player",
@@ -432,10 +439,10 @@ class PerAppAudioCastAndMuteTest {
                     appLabel = "Work Player",
                     uid = 1510299,
                     isSystemApp = false,
-                    isCaptureAllowed = true,
                     isLaunchable = true,
                     // Cross-profile getPackagesForUid unavailable without Shizuku -> null
-                    verifiedSharedUidPackages = null
+                    verifiedSharedUidPackages = null,
+                    appCategory = ApplicationInfo.CATEGORY_AUDIO
                 ),
                 restrictedBili to PublicTargetEnvironment.PublicAppMetadata(
                     packageName = "tv.danmaku.bili",
@@ -443,9 +450,9 @@ class PerAppAudioCastAndMuteTest {
                     appLabel = "Bilibili",
                     uid = 10288,
                     isSystemApp = false,
-                    isCaptureAllowed = false,
                     isLaunchable = true,
-                    verifiedSharedUidPackages = listOf("tv.danmaku.bili")
+                    verifiedSharedUidPackages = listOf("tv.danmaku.bili"),
+                    appCategory = ApplicationInfo.CATEGORY_VIDEO
                 ),
                 nonLaunchableServicePkg to PublicTargetEnvironment.PublicAppMetadata(
                     packageName = "com.android.providers.media",
@@ -453,9 +460,9 @@ class PerAppAudioCastAndMuteTest {
                     appLabel = "Media Storage",
                     uid = 10015,
                     isSystemApp = true,
-                    isCaptureAllowed = true,
                     isLaunchable = false,
-                    verifiedSharedUidPackages = listOf("com.android.providers.media")
+                    verifiedSharedUidPackages = listOf("com.android.providers.media"),
+                    appCategory = ApplicationInfo.CATEGORY_AUDIO
                 )
             )
         )
@@ -511,8 +518,9 @@ class PerAppAudioCastAndMuteTest {
         assertEquals(0, fakeAudioAdapter.currentVolume)
         assertTrue(PhoneGlobalMediaMuteController.isGlobalMuteActive.value)
 
-        val restoreMsg1 = PhoneGlobalMediaMuteController.restorePhoneAudioIfNeeded(app)
-        assertNotNull(restoreMsg1)
+        val restoreRes1 = PhoneGlobalMediaMuteController.restorePhoneAudioIfNeeded(app)
+        assertTrue(restoreRes1.isSuccess)
+        assertNotNull(restoreRes1.getOrNull())
         assertEquals(10, fakeAudioAdapter.currentVolume)
         assertFalse(PhoneGlobalMediaMuteController.isGlobalMuteActive.value)
 
@@ -525,7 +533,7 @@ class PerAppAudioCastAndMuteTest {
         fakeAudioAdapter.currentVolume = 6
         assertFalse(PhoneGlobalMediaMuteController.isPhoneCurrentlyMutedByGlobalMode(app))
 
-        PhoneGlobalMediaMuteController.restorePhoneAudioIfNeeded(app)
+        assertTrue(PhoneGlobalMediaMuteController.restorePhoneAudioIfNeeded(app).isSuccess)
         assertEquals(6, fakeAudioAdapter.currentVolume) // Preserved user's new volume 6, not overwritten with 11!
 
         // 3. Rollback on failure when device refuses to set volume to 0
@@ -552,7 +560,7 @@ class PerAppAudioCastAndMuteTest {
         assertEquals(12, pending?.savedVolume)
 
         // User chooses "恢复原音量"
-        PhoneGlobalMediaMuteController.confirmRestoreLeftoverVolume(app)
+        assertTrue(PhoneGlobalMediaMuteController.confirmRestoreLeftoverVolume(app).isSuccess)
         assertNull(PhoneGlobalMediaMuteController.pendingRecovery.value)
         assertEquals(12, fakeAudioAdapter.currentVolume)
 
@@ -566,7 +574,7 @@ class PerAppAudioCastAndMuteTest {
         )
         PhoneGlobalMediaMuteController.initialize(app, isSessionCurrentlyActive = false)
         assertNotNull(PhoneGlobalMediaMuteController.pendingRecovery.value)
-        PhoneGlobalMediaMuteController.dismissLeftoverRecoveryKeepCurrent(app)
+        assertTrue(PhoneGlobalMediaMuteController.dismissLeftoverRecoveryKeepCurrent(app).isSuccess)
         assertNull(PhoneGlobalMediaMuteController.pendingRecovery.value)
         assertEquals(3, fakeAudioAdapter.currentVolume)
     }
@@ -689,23 +697,547 @@ class PerAppAudioCastAndMuteTest {
         assertEquals(0.6, endpoint2.getVolume(), 0.001)
     }
 
+    // =========================================================================
+    // Section 1: 目录与搜索 (Default Audio/Video Filtering & On-Demand Search)
+    // =========================================================================
+
+    @Test
+    fun defaultCatalogPreFiltersAudioVideoBeforeLabelAndSharedUidAndLoadsExtendedSearchOnDemand() = runBlocking {
+        fakeBackend.setConnectionState(ShizukuConnectionState.UNAVAILABLE)
+
+        val audioApp = CaptureTarget("com.metrolist.music", 0L)
+        val videoApp = CaptureTarget("org.videolan.vlc", 0L)
+        val importedNotesApp = CaptureTarget("com.example.notes", 0L)
+        val unselectedProductivityApp = CaptureTarget("com.example.office", 0L)
+        val unselectedGameApp = CaptureTarget("com.example.game", 0L)
+
+        // Verify Shizuku UserService catalog pre-filtering BEFORE loading labels or querying shared UIDs
+        val shizukuService = ShizukuAudioMuteUserService()
+        val shizukuLabelsLoaded = CopyOnWriteArrayList<String>()
+        val shizukuSharedUidsQueried = CopyOnWriteArrayList<Int>()
+        shizukuService.onLabelLoadedHook = { pkg -> shizukuLabelsLoaded.add(pkg) }
+        shizukuService.onSharedUidQueriedHook = { uid -> shizukuSharedUidsQueried.add(uid) }
+        shizukuService.userProfilesProvider = {
+            listOf(ShizukuAudioMuteUserService.ShellUserProfile(0, 0L, "主空间 (User 0)", ProfileType.PRIMARY, true))
+        }
+        shizukuService.installedAppsProvider = {
+            listOf(
+                ApplicationInfo().apply {
+                    packageName = audioApp.packageName
+                    uid = 10201
+                    category = ApplicationInfo.CATEGORY_AUDIO
+                },
+                ApplicationInfo().apply {
+                    packageName = unselectedProductivityApp.packageName
+                    uid = 10204
+                    category = ApplicationInfo.CATEGORY_PRODUCTIVITY
+                }
+            )
+        }
+        shizukuService.packagesForUidProvider = { uid ->
+            when (uid) {
+                10201 -> listOf(audioApp.packageName)
+                10204 -> listOf(unselectedProductivityApp.packageName)
+                else -> emptyList()
+            }
+        }
+        val shizukuDefaultJson = JSONObject(
+            shizukuService.queryMultiProfileCatalog(mutableListOf(), false)
+        )
+        assertEquals(1, shizukuDefaultJson.getJSONArray("searchableApps").length())
+        assertTrue(shizukuLabelsLoaded.contains(audioApp.packageName))
+        assertFalse(
+            "Shizuku default catalog must filter out non-audio/video apps BEFORE loading labels",
+            shizukuLabelsLoaded.contains(unselectedProductivityApp.packageName)
+        )
+        assertFalse(
+            "Shizuku default catalog must filter out non-audio/video apps BEFORE querying shared UIDs",
+            shizukuSharedUidsQueried.contains(10204)
+        )
+
+        // Now verify Public API fallback catalog & CaptureTargetRepository on-demand search
+        PublicApiTargetResolver.environment = FakePublicTargetEnvironment(
+            profiles = listOf(
+                PublicTargetEnvironment.AccessibleProfile(
+                    userSerialNumber = 0L,
+                    userId = 0,
+                    label = "主空间 (Serial 0)",
+                    profileType = ProfileType.PRIMARY,
+                    isRunning = true,
+                    isCurrentProcessUser = true
+                )
+            ),
+            apps = mapOf(
+                audioApp to PublicTargetEnvironment.PublicAppMetadata(
+                    packageName = audioApp.packageName,
+                    userSerialNumber = 0L,
+                    appLabel = "Metrolist",
+                    uid = 10201,
+                    isSystemApp = false,
+                    isLaunchable = true,
+                    verifiedSharedUidPackages = listOf(audioApp.packageName),
+                    appCategory = ApplicationInfo.CATEGORY_AUDIO
+                ),
+                videoApp to PublicTargetEnvironment.PublicAppMetadata(
+                    packageName = videoApp.packageName,
+                    userSerialNumber = 0L,
+                    appLabel = "VLC",
+                    uid = 10202,
+                    isSystemApp = false,
+                    isLaunchable = true,
+                    verifiedSharedUidPackages = listOf(videoApp.packageName),
+                    appCategory = ApplicationInfo.CATEGORY_VIDEO
+                ),
+                importedNotesApp to PublicTargetEnvironment.PublicAppMetadata(
+                    packageName = importedNotesApp.packageName,
+                    userSerialNumber = 0L,
+                    appLabel = "Imported Notes",
+                    uid = 10203,
+                    isSystemApp = false,
+                    isLaunchable = true,
+                    verifiedSharedUidPackages = listOf(importedNotesApp.packageName),
+                    appCategory = ApplicationInfo.CATEGORY_UNDEFINED
+                ),
+                unselectedProductivityApp to PublicTargetEnvironment.PublicAppMetadata(
+                    packageName = unselectedProductivityApp.packageName,
+                    userSerialNumber = 0L,
+                    appLabel = "Office Suite",
+                    uid = 10204,
+                    isSystemApp = false,
+                    isLaunchable = true,
+                    verifiedSharedUidPackages = listOf(unselectedProductivityApp.packageName),
+                    appCategory = ApplicationInfo.CATEGORY_PRODUCTIVITY
+                ),
+                unselectedGameApp to PublicTargetEnvironment.PublicAppMetadata(
+                    packageName = unselectedGameApp.packageName,
+                    userSerialNumber = 0L,
+                    appLabel = "Action Game",
+                    uid = 10205,
+                    isSystemApp = false,
+                    isLaunchable = true,
+                    verifiedSharedUidPackages = listOf(unselectedGameApp.packageName),
+                    appCategory = ApplicationInfo.CATEGORY_GAME
+                )
+            )
+        )
+
+        CaptureTargetRepository.setTargetsForTesting(
+            selected = setOf(audioApp),
+            imported = setOf(audioApp, importedNotesApp),
+            presets = emptyList()
+        )
+        CaptureTargetRepository.refreshCatalogNowForTesting(app)
+
+        // 1. Default catalog only includes AUDIO, VIDEO, and imported/selected/preset pool apps
+        val defaultSearchable = CaptureTargetRepository.searchableApps.value.map { it.target }.toSet()
+        assertEquals(setOf(audioApp, videoApp, importedNotesApp), defaultSearchable)
+
+        // 2. First non-empty search loads extended catalog once; subsequent typing uses memory cache without rescanning
+        val extendedBeforeSearch = CaptureTargetRepository.extendedCatalogScanCountForTesting.get()
+        CaptureTargetRepository.onSearchQueryChanged(app, "Office")
+        CaptureTargetRepository.awaitIdleForTesting()
+        assertEquals(extendedBeforeSearch + 1, CaptureTargetRepository.extendedCatalogScanCountForTesting.get())
+        assertTrue(CaptureTargetRepository.searchableApps.value.any { it.target == unselectedProductivityApp })
+
+        // Subsequent search query changes do NOT trigger another extended catalog scan
+        CaptureTargetRepository.onSearchQueryChanged(app, "Action")
+        CaptureTargetRepository.awaitIdleForTesting()
+        assertEquals(extendedBeforeSearch + 1, CaptureTargetRepository.extendedCatalogScanCountForTesting.get())
+        assertTrue(CaptureTargetRepository.searchableApps.value.any { it.target == unselectedGameApp })
+
+        // 3. Clearing search immediately restores default filtered catalog from cache without scanning
+        CaptureTargetRepository.onSearchQueryChanged(app, "")
+        assertEquals(extendedBeforeSearch + 1, CaptureTargetRepository.extendedCatalogScanCountForTesting.get())
+        assertEquals(
+            setOf(audioApp, videoApp, importedNotesApp),
+            CaptureTargetRepository.searchableApps.value.map { it.target }.toSet()
+        )
+
+        // 4. Manual package import still adds non-audio/video app and keeps it in default catalog
+        val manualImport = CaptureTargetRepository.importTargetApp(
+            context = app,
+            packageName = unselectedProductivityApp.packageName,
+            userSerialNumber = 0L,
+            selectImmediately = true,
+            isEditingLocked = false
+        )
+        assertTrue(manualImport.isSuccess)
+        assertTrue(CaptureTargetRepository.importedTargets.value.contains(unselectedProductivityApp))
+        assertTrue(CaptureTargetRepository.catalogApps.value.any { it.target == unselectedProductivityApp })
+    }
+
+    // =========================================================================
+    // Section 2: 异步与竞态 (Background Scan, Fast Toggles, Stop-During-Start)
+    // =========================================================================
+
+    @Test
+    fun backgroundCatalogScanDiscardsStaleResultsCoalescesColdStartAndAvoidsFullRescanOnSelectionMutations() = runBlocking {
+        val appA = CaptureTarget("com.metrolist.music", 0L)
+        val appB = CaptureTarget("org.videolan.vlc", 0L)
+        val appC = CaptureTarget("com.other.podcast", 0L)
+
+        val entryA = TargetAppEntry(
+            target = appA,
+            appLabel = "Metrolist",
+            profileLabel = "主空间 (User 0)",
+            profileType = ProfileType.PRIMARY,
+            resolvedUid = 10201,
+            isInstalled = true,
+            isProfileRunning = true,
+            appCategory = ApplicationInfo.CATEGORY_AUDIO
+        )
+        val entryB = TargetAppEntry(
+            target = appB,
+            appLabel = "VLC",
+            profileLabel = "主空间 (User 0)",
+            profileType = ProfileType.PRIMARY,
+            resolvedUid = 10202,
+            isInstalled = true,
+            isProfileRunning = true,
+            appCategory = ApplicationInfo.CATEGORY_VIDEO
+        )
+        val entryC = TargetAppEntry(
+            target = appC,
+            appLabel = "Podcast",
+            profileLabel = "主空间 (User 0)",
+            profileType = ProfileType.PRIMARY,
+            resolvedUid = 10203,
+            isInstalled = true,
+            isProfileRunning = true,
+            appCategory = ApplicationInfo.CATEGORY_AUDIO
+        )
+
+        fakeBackend.catalogAppsToReturn = listOf(entryA, entryB)
+        fakeBackend.resolvedEntriesMap = mapOf(appA to entryA, appB to entryB, appC to entryC)
+
+        CaptureTargetRepository.setTargetsForTesting(
+            selected = setOf(appA),
+            imported = setOf(appA, appB),
+            presets = emptyList()
+        )
+        CaptureTargetRepository.refreshCatalogNowForTesting(app)
+        // Register preset containing uncached appC after initial catalog scan
+        CaptureTargetRepository.setTargetsForTesting(
+            selected = setOf(appA),
+            imported = setOf(appA, appB),
+            presets = listOf(TargetPreset("三应用组合", setOf(appA, appB, appC)))
+        )
+        val baselineScans = CaptureTargetRepository.catalogScanCountForTesting.get()
+        val baselineResolves = CaptureTargetRepository.targetEntryResolveCountForTesting.get()
+
+        // 1. Rapid toggleTargetSelection, clearSelectedTargets, removeImportedTarget update state immediately with ZERO catalog scans
+        assertTrue(CaptureTargetRepository.toggleTargetSelection(app, appB, isEditingLocked = false))
+        assertEquals(setOf(appA, appB), CaptureTargetRepository.selectedTargets.value)
+        assertTrue(CaptureTargetRepository.clearSelectedTargets(app, isEditingLocked = false))
+        assertTrue(CaptureTargetRepository.selectedTargets.value.isEmpty())
+        assertTrue(CaptureTargetRepository.removeImportedTarget(app, appB, isEditingLocked = false))
+        assertFalse(CaptureTargetRepository.importedTargets.value.contains(appB))
+        assertEquals(baselineScans, CaptureTargetRepository.catalogScanCountForTesting.get())
+
+        // 2. applyPreset immediately updates selection and ONLY resolves targets missing from cache (appC)
+        assertTrue(CaptureTargetRepository.applyPreset(app, "三应用组合", isEditingLocked = false))
+        assertEquals(setOf(appA, appB, appC), CaptureTargetRepository.selectedTargets.value)
+        CaptureTargetRepository.awaitIdleForTesting()
+        assertEquals(baselineScans, CaptureTargetRepository.catalogScanCountForTesting.get())
+        assertEquals(baselineResolves + 1, CaptureTargetRepository.targetEntryResolveCountForTesting.get())
+        assertTrue(CaptureTargetRepository.catalogApps.value.any { it.target == appC })
+
+        // 3. Stale scan version is discarded when a newer target mutation occurs during scan
+        val scanStarted = CompletableDeferred<Unit>()
+        val allowScanFinish = CompletableDeferred<Unit>()
+        CaptureTargetRepository.catalogScanInterceptorForTesting = { _ ->
+            if (!scanStarted.isCompleted) {
+                scanStarted.complete(Unit)
+                allowScanFinish.await()
+            }
+            MultiProfileCatalogSnapshot(
+                profiles = listOf(UserProfileInfo(0L, 0, "主空间 (User 0)", ProfileType.PRIMARY, true)),
+                catalogApps = listOf(entryA), // Stale snapshot missing newly imported appD
+                searchableApps = listOf(entryA)
+            )
+        }
+
+        CaptureTargetRepository.refreshCatalog(app)
+        scanStarted.await()
+        // Mutate target pool while scan #1 is still in-flight, bumping latestRequestVersion
+        val appD = CaptureTarget("com.new.player", 0L)
+        val entryD = entryA.copy(target = appD, appLabel = "New Player", resolvedUid = 10204)
+        fakeBackend.resolvedEntriesMap = fakeBackend.resolvedEntriesMap + (appD to entryD)
+        CaptureTargetRepository.importTargetApp(app, appD.packageName, 0L, selectImmediately = true, isEditingLocked = false)
+
+        CaptureTargetRepository.catalogScanInterceptorForTesting = { req ->
+            MultiProfileCatalogSnapshot(
+                profiles = listOf(UserProfileInfo(0L, 0, "主空间 (User 0)", ProfileType.PRIMARY, true)),
+                catalogApps = req.targetPoolSnapshot.mapNotNull { fakeBackend.resolvedEntriesMap[it] },
+                searchableApps = listOf(entryA, entryB, entryC, entryD)
+            )
+        }
+        allowScanFinish.complete(Unit)
+        CaptureTargetRepository.awaitIdleForTesting()
+        // Final catalog must contain appD from the newer state, not overwritten by the stale scan
+        assertTrue(CaptureTargetRepository.catalogApps.value.any { it.target == appD })
+        CaptureTargetRepository.catalogScanInterceptorForTesting = null
+    }
+
+    @Test
+    fun stopDuringStartupInvalidatesGenerationAndCompensatesSoStoppedSessionNeverMutesPhone() = runBlocking {
+        fakeAudioAdapter.currentVolume = 10
+        fakeAudioAdapter.currentMuted = false
+        val activeGen = AtomicLong(1L)
+        val myGen = activeGen.get()
+
+        val muteEntered = CompletableDeferred<Unit>()
+        val allowMuteProceed = CompletableDeferred<Unit>()
+
+        // Simulate startup coroutine entering serialized mute section just as stop invalidates generation
+        val startupJob = async(Dispatchers.IO) {
+            AudioCastSessionCoordinator.withMuteLock {
+                muteEntered.complete(Unit)
+                allowMuteProceed.await()
+                PhoneGlobalMediaMuteController.engageGlobalMediaMute(app)
+                // Stale generation check inside serialized startup block must compensate and restore!
+                if (activeGen.get() != myGen) {
+                    PhoneGlobalMediaMuteController.restorePhoneAudioIfNeeded(app)
+                }
+            }
+        }
+
+        muteEntered.await()
+        // User stops session while startup is in progress -> invalidates generation first
+        activeGen.incrementAndGet()
+        allowMuteProceed.complete(Unit)
+        startupJob.await()
+
+        // Also run serialized stop restoration
+        val stopRestoreErr = AudioCastSessionCoordinator.restorePhoneAudioSerialized(app)
+        assertNull(stopRestoreErr)
+        // Phone volume must be restored to 10 and global mute must NOT remain active
+        assertEquals(10, fakeAudioAdapter.currentVolume)
+        assertFalse(PhoneGlobalMediaMuteController.isGlobalMuteActive.value)
+    }
+
+    // =========================================================================
+    // Section 3: 整体媒体静音的恢复事务 (Global Media Mute Transaction & Recovery)
+    // =========================================================================
+
+    @Test
+    fun globalMediaMuteHandlesAlreadyMutedPhonePersistAndClearFailuresAndBlocksNewSessionUntilResolved() = runBlocking {
+        val viewModel = ScreenCastViewModel(app)
+        val musicTarget = CaptureTarget("com.android.music", 0L)
+        CaptureTargetRepository.setTargetsForTesting(setOf(musicTarget))
+
+        // 1. Phone already muted before start (currentVolume == 0 or wasMuted == true):
+        //    Mode is ready, does NOT call setMusicVolume(0) or write recovery record, and stop keeps original state
+        fakeAudioAdapter.currentVolume = 0
+        fakeAudioAdapter.currentMuted = true
+        fakeAudioAdapter.setVolumeCalls.set(0)
+
+        val alreadyMutedRes = PhoneGlobalMediaMuteController.engageGlobalMediaMute(app)
+        assertTrue(alreadyMutedRes.isSuccess)
+        assertTrue(PhoneGlobalMediaMuteController.isGlobalMuteActive.value)
+        assertEquals(0, fakeAudioAdapter.setVolumeCalls.get())
+        assertNull(PhoneGlobalMediaMuteController.pendingRecovery.value)
+
+        val restoreAlreadyMuted = PhoneGlobalMediaMuteController.restorePhoneAudioIfNeeded(app)
+        assertTrue(restoreAlreadyMuted.isSuccess)
+        assertEquals(0, fakeAudioAdapter.currentVolume)
+        assertTrue(fakeAudioAdapter.currentMuted)
+        assertEquals(0, fakeAudioAdapter.setVolumeCalls.get())
+        assertFalse(PhoneGlobalMediaMuteController.isGlobalMuteActive.value)
+
+        // 2. Persistence commit failure before muting refuses to modify phone audio
+        fakeAudioAdapter.currentVolume = 9
+        fakeAudioAdapter.currentMuted = false
+        PhoneGlobalMediaMuteController.persistCommitOverrideForTesting = { false }
+        val persistFailRes = PhoneGlobalMediaMuteController.engageGlobalMediaMute(app)
+        assertTrue(persistFailRes.isFailure)
+        assertEquals(9, fakeAudioAdapter.currentVolume)
+        assertFalse(PhoneGlobalMediaMuteController.isGlobalMuteActive.value)
+        PhoneGlobalMediaMuteController.persistCommitOverrideForTesting = null
+
+        // 3. Restoration failure (or clear commit failure) returns Result.failure, retains pendingRecovery,
+        //    and blocks starting a new cast session until resolved
+        fakeAudioAdapter.currentVolume = 11
+        fakeAudioAdapter.currentMuted = false
+        assertTrue(PhoneGlobalMediaMuteController.engageGlobalMediaMute(app).isSuccess)
+        assertEquals(0, fakeAudioAdapter.currentVolume)
+
+        fakeAudioAdapter.throwOnSetVolume = IllegalStateException("AudioService binder dead during restore")
+        val failedRestore = PhoneGlobalMediaMuteController.restorePhoneAudioIfNeeded(app)
+        assertTrue(failedRestore.isFailure)
+        assertNotNull(PhoneGlobalMediaMuteController.pendingRecovery.value)
+        assertEquals(11, PhoneGlobalMediaMuteController.pendingRecovery.value?.savedVolume)
+
+        // Attempting to start a new session while pendingRecovery is non-null must be rejected
+        assertFalse(viewModel.initiateStartCastFlow(requireConnectedCastReceiver = false))
+        assertTrue(viewModel.telemetry.value.error.orEmpty().contains("未处理的媒体音量恢复记录"))
+
+        // User clicking "恢复原音量" while hardware still fails returns Result.failure and keeps dialog open
+        val failedUserConfirm = PhoneGlobalMediaMuteController.confirmRestoreLeftoverVolume(app)
+        assertTrue(failedUserConfirm.isFailure)
+        assertNotNull(PhoneGlobalMediaMuteController.pendingRecovery.value)
+
+        // Once hardware recovers, user confirm succeeds, clears pendingRecovery, and restores volume 11
+        fakeAudioAdapter.throwOnSetVolume = null
+        val okUserConfirm = PhoneGlobalMediaMuteController.confirmRestoreLeftoverVolume(app)
+        assertTrue(okUserConfirm.isSuccess)
+        assertNull(PhoneGlobalMediaMuteController.pendingRecovery.value)
+        assertEquals(11, fakeAudioAdapter.currentVolume)
+
+        // 4. Clearing persisted record failure during automatic restore also reports failure and retains pendingRecovery
+        assertTrue(PhoneGlobalMediaMuteController.engageGlobalMediaMute(app).isSuccess)
+        PhoneGlobalMediaMuteController.clearCommitOverrideForTesting = { false }
+        val clearFailRestore = PhoneGlobalMediaMuteController.restorePhoneAudioIfNeeded(app)
+        assertTrue(clearFailRestore.isFailure)
+        assertNotNull(PhoneGlobalMediaMuteController.pendingRecovery.value)
+        PhoneGlobalMediaMuteController.clearCommitOverrideForTesting = null
+        assertTrue(PhoneGlobalMediaMuteController.dismissLeftoverRecoveryKeepCurrent(app).isSuccess)
+    }
+
+    // =========================================================================
+    // Section 4: 定向静音包络的失败回收 (Shizuku VolumeShaper Failure & 3s Retry)
+    // =========================================================================
+
+    @Test
+    fun shizukuVolumeShaperRetainsPausedPlayerOnRemoveFailureRetriesWithin3SecondsAndReportsPendingRestore() {
+        val service = ShizukuAudioMuteUserService()
+        val nowMs = AtomicLong(1_000L)
+        service.elapsedRealtimeProvider = { nowMs.get() }
+
+        val removeAttempts = AtomicInteger(0)
+        val shouldFailRemove = AtomicBoolean(true)
+        val capturedOps = CopyOnWriteArrayList<VolumeShaper.Operation>()
+
+        val fakePlayerProxy = object {
+            @Suppress("unused")
+            fun applyVolumeShaper(
+                config: VolumeShaper.Configuration,
+                operation: VolumeShaper.Operation
+            ) {
+                capturedOps.add(operation)
+                if (operation != VolumeShaper.Operation.PLAY) {
+                    removeAttempts.incrementAndGet()
+                    if (shouldFailRemove.get()) {
+                        throw IllegalStateException("Simulated IPlayer TERMINATE failure")
+                    }
+                }
+            }
+        }
+
+        val currentPlayerState = AtomicInteger(ShizukuAudioMuteUserService.PLAYER_STATE_STARTED)
+        service.playbackSessionsProvider = {
+            listOf(
+                ShizukuAudioMuteUserService.PlaybackSessionDescriptor(
+                    piid = 88,
+                    uid = 10188,
+                    state = currentPlayerState.get(),
+                    playerType = ShizukuAudioMuteUserService.PLAYER_TYPE_JAM_AUDIOTRACK,
+                    usage = AudioAttributes.USAGE_MEDIA,
+                    mutedBy = ShizukuAudioMuteUserService.MUTED_BY_VOLUME_SHAPER,
+                    playerProxy = fakePlayerProxy
+                )
+            )
+        }
+
+        // 1. Acquire lease and shape active player piid=88
+        val acquireJson = JSONObject(service.acquireOrRenewMuteLease(intArrayOf(10188), 3_500L))
+        assertTrue(acquireJson.getBoolean("success"))
+        assertEquals(1, acquireJson.getInt("confirmedMutedPlayerCount"))
+        assertEquals(0, acquireJson.getInt("pendingRestoreCount"))
+
+        // 2. Player transitions to PAUSED (NOT destroyed!) and releaseMuteLease fails to remove shaper
+        currentPlayerState.set(ShizukuAudioMuteUserService.PLAYER_STATE_PAUSED)
+        val releaseFailJson = JSONObject(service.releaseMuteLease())
+        assertFalse("releaseMuteLease must return success=false when shaper removal fails", releaseFailJson.getBoolean("success"))
+        assertEquals(1, releaseFailJson.getInt("pendingRestoreCount"))
+        assertTrue(releaseFailJson.getString("error").contains("未能终止"))
+        assertEquals(1, removeAttempts.get())
+
+        // 3. Watchdog retries within the 3-second retry window (at t=1500ms and t=2500ms)
+        nowMs.set(1_500L)
+        service.triggerWatchdogTickForTesting()
+        assertEquals(2, removeAttempts.get())
+
+        nowMs.set(2_500L)
+        service.triggerWatchdogTickForTesting()
+        assertEquals(3, removeAttempts.get())
+
+        // 4. After 3 seconds (t=4200ms > 1000ms + 3000ms), automatic watchdog retry stops, but record is retained
+        nowMs.set(4_200L)
+        service.triggerWatchdogTickForTesting()
+        assertEquals(3, removeAttempts.get())
+        assertTrue(service.isRetryExhaustedForTesting(88))
+        val snapshotAfterWindow = JSONObject(service.queryPlaybackSnapshot(intArrayOf(10188)))
+        assertEquals(1, snapshotAfterWindow.getInt("pendingRestoreCount"))
+
+        // 5. Explicit releaseMuteLease resets the retry window and succeeds once player allows TERMINATE
+        shouldFailRemove.set(false)
+        nowMs.set(5_000L)
+        val releaseOkJson = JSONObject(service.releaseMuteLease())
+        assertTrue(releaseOkJson.getBoolean("success"))
+        assertEquals(0, releaseOkJson.getInt("pendingRestoreCount"))
+        assertEquals(4, removeAttempts.get())
+
+        // Verify REVERSE was never used across any attempt
+        assertTrue(capturedOps.none { it == VolumeShaper.Operation.REVERSE })
+    }
+
+    @Test
+    fun binderMuteFailureCallbackDoesNotSynchronouslyReenterRemoteReleaseOnCallbackStack() {
+        val inCallbackStack = AtomicBoolean(false)
+        val releaseCalledSynchronouslyInsideCallback = AtomicBoolean(false)
+
+        fakeBackend.onReleaseHook = {
+            if (inCallbackStack.get()) {
+                releaseCalledSynchronouslyInsideCallback.set(true)
+            }
+        }
+
+        val fatalErrors = CopyOnWriteArrayList<String>()
+        runBlocking {
+            ShizukuSessionMuteController.startSessionMuteLease(
+                targetUids = setOf(10188),
+                onFatalMuteError = { fatalErrors.add(it) }
+            )
+        }
+
+        inCallbackStack.set(true)
+        try {
+            fakeBackend.emitRemoteMuteFailure("Watchdog detected unshaperable player")
+        } finally {
+            inCallbackStack.set(false)
+        }
+
+        assertFalse(
+            "Binder callback must not synchronously call releaseLeaseImmediately on the callback stack",
+            releaseCalledSynchronouslyInsideCallback.get()
+        )
+        assertEquals(1, fatalErrors.size)
+        assertFalse(ShizukuSessionMuteController.muteTelemetry.value.leaseActive)
+    }
+
     private class FakeSystemMediaAudioAdapter(
         var currentVolume: Int,
         val maxVolume: Int,
         var currentMuted: Boolean
     ) : SystemMediaAudioAdapter {
         var refuseZeroVolume: Boolean = false
+        var throwOnSetVolume: Exception? = null
+        val setVolumeCalls = AtomicInteger(0)
 
         override fun getMusicVolume(context: Context): Int = currentVolume
         override fun getMusicMaxVolume(context: Context): Int = maxVolume
         override fun isMusicMuted(context: Context): Boolean = currentMuted
 
         override fun setMusicVolume(context: Context, volume: Int) {
+            setVolumeCalls.incrementAndGet()
+            throwOnSetVolume?.let { throw it }
             if (refuseZeroVolume && volume == 0) return
             currentVolume = volume.coerceIn(0, maxVolume)
         }
 
         override fun setMusicMuted(context: Context, muted: Boolean) {
+            throwOnSetVolume?.let { throw it }
             currentMuted = muted
         }
     }
@@ -782,7 +1314,10 @@ class PerAppAudioCastAndMuteTest {
         private val stateListeners = CopyOnWriteArrayList<(LeaseAcquisitionOutcome) -> Unit>()
 
         val releaseCalls = AtomicInteger(0)
+        var onReleaseHook: (() -> Unit)? = null
         @Volatile var activeStartedUids: Set<Int> = emptySet()
+        @Volatile var catalogAppsToReturn: List<TargetAppEntry> = emptyList()
+        @Volatile var resolvedEntriesMap: Map<CaptureTarget, TargetAppEntry> = emptyMap()
         @Volatile var nextResolutionResult: TargetResolutionResult = TargetResolutionResult(
             isValid = true,
             resolvedUids = setOf(10188)
@@ -795,6 +1330,12 @@ class PerAppAudioCastAndMuteTest {
             lastMuteConfirmationLatencyMs = 12L,
             maxObservedNewTrackMuteLatencyMs = 12L
         )
+        @Volatile var releaseOutcomeToReturn: LeaseAcquisitionOutcome = LeaseAcquisitionOutcome(
+            success = true,
+            activeTargetPlayerCount = 0,
+            confirmedMutedPlayerCount = 0,
+            pendingRestoreCount = 0
+        )
 
         fun setConnectionState(state: ShizukuConnectionState) {
             _connectionState.value = state
@@ -805,18 +1346,38 @@ class PerAppAudioCastAndMuteTest {
 
         override fun queryCatalog(
             context: Context,
-            importedTargets: Set<CaptureTarget>
+            importedTargets: Set<CaptureTarget>,
+            includeOtherApps: Boolean
         ): MultiProfileCatalogSnapshot {
             val profiles = listOf(
                 UserProfileInfo(0L, 0, "主空间 (User 0)", ProfileType.PRIMARY, true),
                 UserProfileInfo(10L, 10, "工作资料 (User 10)", ProfileType.WORK, true),
                 UserProfileInfo(999L, 999, "克隆资料 (User 999)", ProfileType.CLONE, true)
             )
+            val catalog = importedTargets.mapNotNull { resolvedEntriesMap[it] }.ifEmpty { catalogAppsToReturn }
             return MultiProfileCatalogSnapshot(
                 profiles = profiles,
-                catalogApps = emptyList(),
-                searchableApps = emptyList()
+                catalogApps = catalog,
+                searchableApps = catalogAppsToReturn
             )
+        }
+
+        override fun resolveTargetEntries(
+            context: Context,
+            targets: Set<CaptureTarget>
+        ): List<TargetAppEntry> {
+            return targets.map { target ->
+                resolvedEntriesMap[target] ?: TargetAppEntry(
+                    target = target,
+                    appLabel = target.packageName,
+                    profileLabel = "主空间 (User ${target.userSerialNumber})",
+                    profileType = ProfileType.PRIMARY,
+                    resolvedUid = 10188,
+                    isInstalled = true,
+                    isProfileRunning = true,
+                    appCategory = ApplicationInfo.CATEGORY_AUDIO
+                )
+            }
         }
 
         override fun resolveAndValidateTargets(
@@ -829,8 +1390,10 @@ class PerAppAudioCastAndMuteTest {
             leaseDurationMs: Long
         ): LeaseAcquisitionOutcome = leaseOutcomeToReturn
 
-        override fun releaseLeaseImmediately() {
+        override fun releaseLeaseImmediately(): LeaseAcquisitionOutcome {
+            onReleaseHook?.invoke()
             releaseCalls.incrementAndGet()
+            return releaseOutcomeToReturn
         }
 
         override fun hasActiveStartedPlaybackForUids(targetUids: Set<Int>): Boolean {

@@ -461,7 +461,7 @@ class WebRtcHalFaultInjectionTest {
     }
 
     @Test
-    fun cleanupTimeoutLocksSameProcessCaptureAndRetainsError() {
+    fun cleanupTimeoutLocksSameProcessCaptureAndRetainsError() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val viewModel = ScreenCastViewModel(app)
 

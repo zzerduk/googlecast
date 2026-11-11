@@ -5,6 +5,7 @@ import android.media.AudioAttributes
 import android.media.AudioPlaybackConfiguration
 import android.media.VolumeShaper
 import android.os.Binder
+import android.os.Build
 import android.os.IBinder
 import android.os.Parcel
 import android.os.SystemClock
@@ -32,15 +33,37 @@ import kotlin.system.exitProcess
  * - Uses dedicated VolumeShaper envelope ID ([DEDICATED_SHAPER_ID]) and removes ONLY its own
  *   envelope on stop or lease expiry, never modifying global stream volume or writing back old volume levels.
  */
+@android.annotation.SuppressLint("NewApi", "SoonBlockedPrivateApi")
 class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
 
-    private data class ShapedSessionRecord(
+    internal data class PlaybackSessionDescriptor(
+        val piid: Int,
+        val uid: Int,
+        val state: Int,
+        val playerType: Int,
+        val usage: Int,
+        val mutedBy: Int,
+        val playerProxy: Any?
+    )
+
+    internal data class ShapedSessionRecord(
         val piid: Int,
         val uid: Int,
         val playerProxy: Any,
         val appliedAtElapsedNs: Long,
         @Volatile var confirmedAtElapsedNs: Long = 0L,
-        @Volatile var lastMutedByMask: Int = 0
+        @Volatile var lastMutedByMask: Int = 0,
+        @Volatile var pendingRestore: Boolean = false,
+        @Volatile var firstRestoreFailedAtElapsedMs: Long = 0L,
+        @Volatile var restoreRetryExhausted: Boolean = false
+    )
+
+    internal data class ShellUserProfile(
+        val userId: Int,
+        val userSerialNumber: Long,
+        val label: String,
+        val profileType: ProfileType,
+        val isRunning: Boolean
     )
 
     private val lock = Any()
@@ -60,6 +83,16 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
     @Volatile private var playbackCallbackToken: IBinder? = null
     private val destroyed = AtomicBoolean(false)
 
+    // Test hooks for deterministic unit verification
+    @Volatile internal var elapsedRealtimeProvider: () -> Long = { SystemClock.elapsedRealtime() }
+    @Volatile internal var playbackSessionsProvider: (() -> List<PlaybackSessionDescriptor>)? = null
+    @Volatile internal var userProfilesProvider: (() -> List<ShellUserProfile>)? = null
+    @Volatile internal var installedAppsProvider: ((Int) -> List<ApplicationInfo>)? = null
+    @Volatile internal var appInfoProvider: ((String, Int) -> ApplicationInfo?)? = null
+    @Volatile internal var packagesForUidProvider: ((Int) -> List<String>)? = null
+    @Volatile internal var onLabelLoadedHook: ((String) -> Unit)? = null
+    @Volatile internal var onSharedUidQueriedHook: ((Int) -> Unit)? = null
+
     init {
         scheduler.scheduleAtFixedRate(
             { checkLeaseAndEnforceSessions() },
@@ -70,11 +103,14 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         registerSystemPlaybackDispatcher()
     }
 
-    override fun queryMultiProfileCatalog(importedTargets: MutableList<String>?): String {
+    override fun queryMultiProfileCatalog(
+        importedTargets: MutableList<String>?,
+        includeOtherApps: Boolean
+    ): String {
         val importedSet = importedTargets.orEmpty()
             .mapNotNull { CaptureTarget.fromStorageKey(it) }
             .toSet()
-        val profiles = queryUserProfilesInternal()
+        val profiles = userProfilesProvider?.invoke() ?: queryUserProfilesInternal()
         val catalogAppsArray = JSONArray()
         val allInstalledArray = JSONArray()
         val profilesArray = JSONArray()
@@ -90,20 +126,23 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
                     .put("profileType", profile.profileType.name)
                     .put("isRunning", profile.isRunning)
             )
-            val installedApps = queryInstalledApplicationsForUser(profile.userId)
+            val installedApps = installedAppsProvider?.invoke(profile.userId)
+                ?: queryInstalledApplicationsForUser(profile.userId)
             for (appInfo in installedApps) {
                 val pkg = appInfo.packageName ?: continue
                 val target = CaptureTarget(pkg, profile.userSerialNumber)
+                val category = extractAppCategory(appInfo)
+                if (!includeOtherApps && !isAudioOrVideoCategory(category) && target !in importedSet) {
+                    continue
+                }
                 val fullUid = appInfo.uid
-                val sharedSiblings = queryPackagesForUidInternal(fullUid)
-                val isCaptureRestricted = !isPlaybackCaptureAllowed(appInfo)
+                val sharedSiblings = queryPackagesForUidSafe(fullUid)
                 val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 &&
                     (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
                 val appLabel = loadAppLabelSafe(appInfo)
                 val statusReason = buildStatusReason(
                     isProfileRunning = profile.isRunning,
-                    isInstalled = true,
-                    isCaptureRestricted = isCaptureRestricted
+                    isInstalled = true
                 )
 
                 val itemJson = JSONObject()
@@ -115,9 +154,9 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
                     .put("isInstalled", true)
                     .put("isProfileRunning", profile.isRunning)
                     .put("isSystemApp", isSystem)
+                    .put("appCategory", category)
                     .put("resolvedUid", fullUid)
                     .put("sharedUidPackages", JSONArray(sharedSiblings))
-                    .put("isCaptureRestricted", isCaptureRestricted)
                     .put("statusReason", statusReason ?: JSONObject.NULL)
 
                 if (seenSearchableTargets.add(target.toStorageKey())) {
@@ -134,35 +173,40 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         for (imported in importedSet) {
             if (!seenCatalogTargets.add(imported.toStorageKey())) continue
             val profile = profileBySerial[imported.userSerialNumber]
-            val appInfo = profile?.let { queryApplicationInfoForUser(imported.packageName, it.userId) }
+            val appInfo = profile?.let {
+                appInfoProvider?.invoke(imported.packageName, it.userId)
+                    ?: queryApplicationInfoForUser(imported.packageName, it.userId)
+            }
             val isInstalled = appInfo != null
             val isProfileRunning = profile?.isRunning == true
-            val isRestricted = appInfo != null && !isPlaybackCaptureAllowed(appInfo)
             val isSystem = appInfo != null &&
                 (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 &&
                 (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
+            val category = appInfo?.let { extractAppCategory(it) } ?: ApplicationInfo.CATEGORY_UNDEFINED
             val fullUid = appInfo?.uid
-            val siblings = if (fullUid != null) queryPackagesForUidInternal(fullUid) else emptyList()
+            val siblings = if (fullUid != null) queryPackagesForUidSafe(fullUid) else emptyList()
             val reason = buildStatusReason(
                 isProfileRunning = isProfileRunning,
-                isInstalled = isInstalled,
-                isCaptureRestricted = isRestricted
+                isInstalled = isInstalled
             )
-            catalogAppsArray.put(
-                JSONObject()
-                    .put("packageName", imported.packageName)
-                    .put("userSerialNumber", imported.userSerialNumber)
-                    .put("appLabel", appInfo?.let { loadAppLabelSafe(it) } ?: imported.packageName)
-                    .put("profileType", (profile?.profileType ?: ProfileType.OTHER).name)
-                    .put("profileLabel", profile?.label ?: "空间 #${imported.userSerialNumber}")
-                    .put("isInstalled", isInstalled)
-                    .put("isProfileRunning", isProfileRunning)
-                    .put("isSystemApp", isSystem)
-                    .put("resolvedUid", fullUid ?: JSONObject.NULL)
-                    .put("sharedUidPackages", JSONArray(siblings))
-                    .put("isCaptureRestricted", isRestricted)
-                    .put("statusReason", reason ?: JSONObject.NULL)
-            )
+            val itemJson = JSONObject()
+                .put("packageName", imported.packageName)
+                .put("userSerialNumber", imported.userSerialNumber)
+                .put("appLabel", appInfo?.let { loadAppLabelSafe(it) } ?: imported.packageName)
+                .put("profileType", (profile?.profileType ?: ProfileType.OTHER).name)
+                .put("profileLabel", profile?.label ?: "空间 #${imported.userSerialNumber}")
+                .put("isInstalled", isInstalled)
+                .put("isProfileRunning", isProfileRunning)
+                .put("isSystemApp", isSystem)
+                .put("appCategory", category)
+                .put("resolvedUid", fullUid ?: JSONObject.NULL)
+                .put("sharedUidPackages", JSONArray(siblings))
+                .put("statusReason", reason ?: JSONObject.NULL)
+
+            catalogAppsArray.put(itemJson)
+            if (isInstalled && isProfileRunning && seenSearchableTargets.add(imported.toStorageKey())) {
+                allInstalledArray.put(itemJson)
+            }
         }
 
         return JSONObject()
@@ -184,7 +228,8 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
                 .toString()
         }
 
-        val profilesBySerial = queryUserProfilesInternal().associateBy { it.userSerialNumber }
+        val profilesBySerial = (userProfilesProvider?.invoke() ?: queryUserProfilesInternal())
+            .associateBy { it.userSerialNumber }
         val resolvedUids = LinkedHashSet<Int>()
         val targetUidArray = JSONArray()
         val unavailableArray = JSONArray()
@@ -200,20 +245,13 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
                 )
                 continue
             }
-            val appInfo = queryApplicationInfoForUser(target.packageName, profile.userId)
+            val appInfo = appInfoProvider?.invoke(target.packageName, profile.userId)
+                ?: queryApplicationInfoForUser(target.packageName, profile.userId)
             if (appInfo == null) {
                 unavailableArray.put(
                     JSONObject()
                         .put("target", target.toStorageKey())
                         .put("reason", "应用 ${target.packageName} 在 ${profile.label} 中未安装")
-                )
-                continue
-            }
-            if (!isPlaybackCaptureAllowed(appInfo)) {
-                unavailableArray.put(
-                    JSONObject()
-                        .put("target", target.toStorageKey())
-                        .put("reason", "${target.packageName} (${profile.label}): 应用声明了 allowAudioPlaybackCapture=false 禁止系统回采")
                 )
                 continue
             }
@@ -227,7 +265,7 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
             )
 
             // Verify shared UID completeness: all packages sharing `fullUid` in this profile MUST be selected
-            val siblings = queryPackagesForUidInternal(fullUid)
+            val siblings = queryPackagesForUidSafe(fullUid)
             val unselectedSiblings = siblings.filter { siblingPkg ->
                 CaptureTarget(siblingPkg, target.userSerialNumber) !in parsedTargets
             }
@@ -269,28 +307,55 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         synchronized(lock) {
             val uidSet = targetUids?.filter { it > 0 }?.toSet().orEmpty()
             if (uidSet.isEmpty()) {
-                releaseMuteLeaseInternalLocked()
+                releaseMuteLeaseInternalLocked(resetRetryWindow = false)
                 return buildLeaseResponseLocked(
                     success = false,
                     error = "目标 UID 集合为空，无法建立会话静音租约。"
                 )
             }
 
+            val nowMs = elapsedRealtimeProvider()
+            if (pendingRestoreCountLocked() > 0) {
+                val sessions = getActivePlaybackSessionsInternal()
+                for (record in shapedSessions.values.filter { it.pendingRestore }) {
+                    tryRemoveShaperOrMarkPendingLocked(record, nowMs, sessions)
+                }
+                val remainingPending = pendingRestoreCountLocked()
+                if (remainingPending > 0) {
+                    val err = "仍有 $remainingPending 个播放会话处于待恢复状态，恢复完成前禁止建立新静音租约。"
+                    return buildLeaseResponseLocked(
+                        success = false,
+                        error = err
+                    )
+                }
+            }
+
             val clampedLeaseMs = leaseDurationMs.coerceIn(500L, MAX_LEASE_DURATION_MS)
-            val nowMs = SystemClock.elapsedRealtime()
             this.targetUids = uidSet
             this.leaseExpiresAtElapsedMs = nowMs + clampedLeaseMs
             this.leaseActive = true
 
+            val currentSessions = getActivePlaybackSessionsInternal()
             val toUnshape = shapedSessions.values.filter { it.uid !in uidSet }
+            var unshapeFailed = false
             for (record in toUnshape) {
-                removeDedicatedShaperFromPlayer(record.playerProxy)
-                shapedSessions.remove(record.piid)
+                if (!tryRemoveShaperOrMarkPendingLocked(record, nowMs, currentSessions)) {
+                    unshapeFailed = true
+                }
+            }
+            if (unshapeFailed) {
+                releaseMuteLeaseInternalLocked(resetRetryWindow = false)
+                val err = "移除非目标 UID 播放器专属静音包络失败（待恢复 ${pendingRestoreCountLocked()} 个会话），已终止租约。"
+                notifyFailureCallbacks(err)
+                return buildLeaseResponseLocked(
+                    success = false,
+                    error = err
+                )
             }
 
             val enforcementError = enforceMuteOnActiveTargetSessionsLocked(uidSet)
             if (enforcementError != null) {
-                releaseMuteLeaseInternalLocked()
+                releaseMuteLeaseInternalLocked(resetRetryWindow = false)
                 notifyFailureCallbacks(enforcementError)
                 return buildLeaseResponseLocked(
                     success = false,
@@ -306,8 +371,15 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
 
     override fun releaseMuteLease(): String {
         synchronized(lock) {
-            releaseMuteLeaseInternalLocked()
-            val snapshot = buildLeaseResponseLocked(success = true, error = null)
+            releaseMuteLeaseInternalLocked(resetRetryWindow = true)
+            val pendingCount = pendingRestoreCountLocked()
+            val ok = pendingCount == 0
+            val err = if (ok) {
+                null
+            } else {
+                "仍有 $pendingCount 个播放会话未能终止专属静音包络，已保留记录并在 3 秒窗口内重试恢复。"
+            }
+            val snapshot = buildLeaseResponseLocked(success = ok, error = err)
             notifyStateCallbacks(snapshot)
             return snapshot
         }
@@ -315,20 +387,16 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
 
     override fun queryPlaybackSnapshot(targetUids: IntArray?): String {
         val uidSet = targetUids?.filter { it > 0 }?.toSet() ?: this.targetUids
-        val configs = getActivePlaybackConfigurationsInternal()
+        val sessions = getActivePlaybackSessionsInternal()
         var activeStartedCount = 0
         var confirmedMutedCount = 0
         var combinedMutedBy = 0
 
-        for (cfg in configs) {
-            val uid = getConfigClientUid(cfg)
-            val state = getConfigPlayerState(cfg)
-            val usage = getConfigUsage(cfg)
-            if (uid in uidSet && state == PLAYER_STATE_STARTED && PlaybackCaptureConfigBuilder.isMatchingMediaUsage(usage)) {
+        for (s in sessions) {
+            if (s.uid in uidSet && s.state == PLAYER_STATE_STARTED && PlaybackCaptureConfigBuilder.isMatchingMediaUsage(s.usage)) {
                 activeStartedCount++
-                val mutedBy = getConfigMutedBy(cfg)
-                combinedMutedBy = combinedMutedBy or mutedBy
-                if (isConfirmedMutedInMixer(mutedBy)) {
+                combinedMutedBy = combinedMutedBy or s.mutedBy
+                if (isConfirmedMutedInMixer(s.mutedBy)) {
                     confirmedMutedCount++
                 }
             }
@@ -338,6 +406,7 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
             .put("hasActiveStartedPlayback", activeStartedCount > 0)
             .put("activeTargetPlayerCount", activeStartedCount)
             .put("confirmedMutedPlayerCount", confirmedMutedCount)
+            .put("pendingRestoreCount", pendingRestoreCountLocked())
             .put("lastMixerMutedByMask", combinedMutedBy)
             .put("lastMuteConfirmationLatencyMs", lastConfirmationLatencyMs)
             .put("maxObservedNewTrackMuteLatencyMs", maxObservedLatencyMs)
@@ -354,7 +423,7 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
                     callbacks.remove(callback)
                     if (callbacks.isEmpty()) {
                         synchronized(lock) {
-                            releaseMuteLeaseInternalLocked()
+                            releaseMuteLeaseInternalLocked(resetRetryWindow = false)
                         }
                     }
                 },
@@ -372,7 +441,7 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
     override fun destroy() {
         if (destroyed.compareAndSet(false, true)) {
             synchronized(lock) {
-                releaseMuteLeaseInternalLocked()
+                releaseMuteLeaseInternalLocked(resetRetryWindow = false)
             }
             unregisterSystemPlaybackDispatcher()
             scheduler.shutdownNow()
@@ -380,15 +449,48 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         }
     }
 
+    internal fun triggerWatchdogTickForTesting() {
+        checkLeaseAndEnforceSessions()
+    }
+
+    internal fun getTrackedSessionPiidsForTesting(): Set<Int> {
+        synchronized(lock) {
+            return shapedSessions.keys.toSet()
+        }
+    }
+
+    internal fun getPendingRestorePiidsForTesting(): Set<Int> {
+        synchronized(lock) {
+            return shapedSessions.values.filter { it.pendingRestore }.map { it.piid }.toSet()
+        }
+    }
+
+    internal fun isRetryExhaustedForTesting(piid: Int): Boolean {
+        synchronized(lock) {
+            return shapedSessions[piid]?.restoreRetryExhausted == true
+        }
+    }
+
     private fun checkLeaseAndEnforceSessions() {
         synchronized(lock) {
-            if (!leaseActive) return
-            val nowMs = SystemClock.elapsedRealtime()
+            val nowMs = elapsedRealtimeProvider()
+            if (!leaseActive) {
+                if (shapedSessions.values.any { it.pendingRestore && !it.restoreRetryExhausted }) {
+                    retryPendingRestoresOnWatchdogLocked(nowMs)
+                }
+                return
+            }
             if (nowMs >= leaseExpiresAtElapsedMs) {
-                releaseMuteLeaseInternalLocked()
+                releaseMuteLeaseInternalLocked(resetRetryWindow = false)
+                val pendingCount = pendingRestoreCountLocked()
+                val err = if (pendingCount == 0) {
+                    "会话静音租约已到期（超过 3 秒未续期），已自动移除静音包络恢复原声。"
+                } else {
+                    "会话静音租约已到期，仍有 $pendingCount 个会话待恢复静音包络。"
+                }
                 val expiredSnapshot = buildLeaseResponseLocked(
                     success = false,
-                    error = "会话静音租约已到期（超过 3 秒未续期），已自动移除静音包络恢复原声。"
+                    error = err
                 )
                 notifyStateCallbacks(expiredSnapshot)
                 return
@@ -397,25 +499,59 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
             if (currentTargets.isNotEmpty()) {
                 val err = enforceMuteOnActiveTargetSessionsLocked(currentTargets)
                 if (err != null) {
-                    releaseMuteLeaseInternalLocked()
+                    releaseMuteLeaseInternalLocked(resetRetryWindow = false)
                     notifyFailureCallbacks(err)
                 }
             }
         }
     }
 
+    private fun retryPendingRestoresOnWatchdogLocked(nowMs: Long) {
+        val sessions = getActivePlaybackSessionsInternal()
+        var anyRecovered = false
+        var anyNewlyExhausted = false
+
+        for (record in shapedSessions.values.toList()) {
+            if (!record.pendingRestore || record.restoreRetryExhausted) continue
+            val elapsedSinceFirstFail = (nowMs - record.firstRestoreFailedAtElapsedMs).coerceAtLeast(0L)
+            if (elapsedSinceFirstFail <= RESTORE_RETRY_WINDOW_MS) {
+                val ok = tryRemoveShaperOrMarkPendingLocked(record, nowMs, sessions)
+                if (ok) {
+                    anyRecovered = true
+                } else if (nowMs - record.firstRestoreFailedAtElapsedMs >= RESTORE_RETRY_WINDOW_MS) {
+                    record.restoreRetryExhausted = true
+                    anyNewlyExhausted = true
+                }
+            } else {
+                record.restoreRetryExhausted = true
+                anyNewlyExhausted = true
+            }
+        }
+
+        val remainingPending = pendingRestoreCountLocked()
+        if (remainingPending == 0 && anyRecovered) {
+            val recoveredSnapshot = buildLeaseResponseLocked(success = true, error = null)
+            notifyStateCallbacks(recoveredSnapshot)
+        } else if (anyNewlyExhausted) {
+            val err = "定向静音包络自动恢复重试已满 3 秒仍未完成（剩余 $remainingPending 个会话待恢复），已保留记录。"
+            val failedSnapshot = buildLeaseResponseLocked(success = false, error = err)
+            notifyStateCallbacks(failedSnapshot)
+            notifyFailureCallbacks(err)
+        }
+    }
+
     private fun enforceMuteOnActiveTargetSessionsLocked(uidSet: Set<Int>): String? {
-        val configs = getActivePlaybackConfigurationsInternal()
+        val sessions = getActivePlaybackSessionsInternal()
         val activeTargetPiids = HashSet<Int>()
         val unconfirmedPiids = LinkedHashMap<Int, Long>()
 
-        for (cfg in configs) {
-            val uid = getConfigClientUid(cfg)
+        for (s in sessions) {
+            val uid = s.uid
             if (uid !in uidSet) continue
-            val usage = getConfigUsage(cfg)
+            val usage = s.usage
             if (!PlaybackCaptureConfigBuilder.isMatchingMediaUsage(usage)) continue
-            val state = getConfigPlayerState(cfg)
-            val piid = getConfigPiid(cfg)
+            val state = s.state
+            val piid = s.piid
             if (state != PLAYER_STATE_STARTED) {
                 firstSeenStartedNs.remove(piid)
                 continue
@@ -426,17 +562,17 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
                 SystemClock.elapsedRealtimeNanos()
             }
 
-            val playerType = getConfigPlayerType(cfg)
+            val playerType = s.playerType
             if (!isSupportedVolumeShaperPlayerType(playerType)) {
                 return "检测到不支持 VolumeShaper 会话静音的播放器 (UID=$uid, piid=$piid, type=$playerType)，已终止投放并恢复会话。"
             }
 
-            val playerProxy = getConfigPlayerProxy(cfg)
+            val playerProxy = s.playerProxy
                 ?: return "无法获取目标播放器控制代理 IPlayer (UID=$uid, piid=$piid)，已终止投放并恢复会话。"
 
-            val currentMutedBy = getConfigMutedBy(cfg)
+            val currentMutedBy = s.mutedBy
             val existingRecord = shapedSessions[piid]
-            if (existingRecord != null && isConfirmedMutedInMixer(currentMutedBy)) {
+            if (existingRecord != null && !existingRecord.pendingRestore && isConfirmedMutedInMixer(currentMutedBy)) {
                 existingRecord.lastMutedByMask = currentMutedBy
                 lastMixerMutedByMask = currentMutedBy
                 if (existingRecord.confirmedAtElapsedNs == 0L) {
@@ -462,36 +598,42 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
                     playerProxy = playerProxy,
                     appliedAtElapsedNs = SystemClock.elapsedRealtimeNanos()
                 )
+            } else {
+                existingRecord.pendingRestore = false
+                existingRecord.firstRestoreFailedAtElapsedMs = 0L
+                existingRecord.restoreRetryExhausted = false
             }
             unconfirmedPiids[piid] = startedEventNs
         }
 
+        val nowMs = elapsedRealtimeProvider()
         val stalePiids = shapedSessions.keys.filter { it !in activeTargetPiids }
         for (stalePiid in stalePiids) {
-            val removed = shapedSessions.remove(stalePiid)
-            if (removed != null) {
-                removeDedicatedShaperFromPlayer(removed.playerProxy)
-            }
+            val record = shapedSessions[stalePiid] ?: continue
+            val removedOk = tryRemoveShaperOrMarkPendingLocked(record, nowMs, sessions)
             firstSeenStartedNs.remove(stalePiid)
+            if (!removedOk) {
+                return "播放器会话 (UID=${record.uid}, piid=${record.piid}) 专属静音包络终止失败，已终止投放并转入后台待恢复重试。"
+            }
         }
 
         if (unconfirmedPiids.isEmpty()) {
             return null
         }
 
-        val pollStartMs = SystemClock.elapsedRealtime()
-        while (SystemClock.elapsedRealtime() - pollStartMs <= MAX_CONFIRMATION_WAIT_MS) {
-            val latestConfigs = getActivePlaybackConfigurationsInternal()
-            val configByPiid = latestConfigs.associateBy { getConfigPiid(it) }
+        val pollStartMs = elapsedRealtimeProvider()
+        while (elapsedRealtimeProvider() - pollStartMs <= MAX_CONFIRMATION_WAIT_MS) {
+            val latestSessions = getActivePlaybackSessionsInternal()
+            val sessionByPiid = latestSessions.associateBy { it.piid }
             val iterator = unconfirmedPiids.entries.iterator()
             while (iterator.hasNext()) {
                 val (piid, startedNs) = iterator.next()
-                val latestCfg = configByPiid[piid]
-                if (latestCfg == null || getConfigPlayerState(latestCfg) != PLAYER_STATE_STARTED) {
+                val latestCfg = sessionByPiid[piid]
+                if (latestCfg == null || latestCfg.state != PLAYER_STATE_STARTED) {
                     iterator.remove()
                     continue
                 }
-                val mutedBy = getConfigMutedBy(latestCfg)
+                val mutedBy = latestCfg.mutedBy
                 if (isConfirmedMutedInMixer(mutedBy)) {
                     val confirmedNs = SystemClock.elapsedRealtimeNanos()
                     val latencyMs = ((confirmedNs - startedNs) / 1_000_000L).coerceAtLeast(0L)
@@ -530,32 +672,92 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         }
     }
 
-    private fun releaseMuteLeaseInternalLocked() {
+    private fun releaseMuteLeaseInternalLocked(resetRetryWindow: Boolean) {
         leaseActive = false
         leaseExpiresAtElapsedMs = 0L
         targetUids = emptySet()
-        for ((_, record) in shapedSessions) {
-            removeDedicatedShaperFromPlayer(record.playerProxy)
-        }
-        shapedSessions.clear()
         firstSeenStartedNs.clear()
+
+        val nowMs = elapsedRealtimeProvider()
+        val sessions = getActivePlaybackSessionsInternal()
+        for (record in shapedSessions.values.toList()) {
+            if (resetRetryWindow && record.pendingRestore) {
+                record.firstRestoreFailedAtElapsedMs = 0L
+                record.restoreRetryExhausted = false
+            }
+            tryRemoveShaperOrMarkPendingLocked(record, nowMs, sessions)
+        }
+    }
+
+    private fun tryRemoveShaperOrMarkPendingLocked(
+        record: ShapedSessionRecord,
+        nowMs: Long,
+        sessions: List<PlaybackSessionDescriptor>
+    ): Boolean {
+        val removed = removeDedicatedShaperFromPlayer(record.playerProxy)
+        if (removed || isPlayerConfirmedDestroyed(record, sessions)) {
+            shapedSessions.remove(record.piid)
+            firstSeenStartedNs.remove(record.piid)
+            return true
+        }
+        record.pendingRestore = true
+        if (record.firstRestoreFailedAtElapsedMs == 0L) {
+            record.firstRestoreFailedAtElapsedMs = nowMs
+            record.restoreRetryExhausted = false
+        } else if (nowMs - record.firstRestoreFailedAtElapsedMs >= RESTORE_RETRY_WINDOW_MS) {
+            record.restoreRetryExhausted = true
+        }
+        return false
+    }
+
+    private fun isPlayerConfirmedDestroyed(
+        record: ShapedSessionRecord,
+        sessions: List<PlaybackSessionDescriptor>
+    ): Boolean {
+        val matchingSession = sessions.firstOrNull { it.piid == record.piid }
+        if (matchingSession != null) {
+            // PLAYER_STATE_PAUSED (3) or PLAYER_STATE_STOPPED (4) is NOT destroyed!
+            // Only PLAYER_STATE_RELEASED (0) indicates the player was released/destroyed.
+            if (matchingSession.state == PLAYER_STATE_RELEASED) {
+                return true
+            }
+            return false
+        }
+        // Check if proxy itself reports destroyed or dead binder
+        val proxy = record.playerProxy
+        val explicitlyDestroyed = runCatching {
+            val m = proxy.javaClass.methods.firstOrNull {
+                it.name == "isPlayerDestroyed" && it.parameterTypes.isEmpty()
+            }
+            (m?.invoke(proxy) as? Boolean) == true
+        }.getOrDefault(false)
+        if (explicitlyDestroyed) return true
+
+        val binderDead = runCatching {
+            val asBinder = proxy.javaClass.methods.firstOrNull {
+                it.name == "asBinder" && it.parameterTypes.isEmpty()
+            }
+            val binder = asBinder?.invoke(proxy) as? IBinder
+            binder != null && !binder.pingBinder()
+        }.getOrDefault(false)
+        return binderDead
+    }
+
+    private fun pendingRestoreCountLocked(): Int {
+        return shapedSessions.values.count { it.pendingRestore }
     }
 
     private fun buildLeaseResponseLocked(success: Boolean, error: String?): String {
-        val configs = getActivePlaybackConfigurationsInternal()
+        val sessions = getActivePlaybackSessionsInternal()
         var activeTargetCount = 0
         var confirmedMutedCount = 0
         var combinedMask = 0
 
-        for (cfg in configs) {
-            val uid = getConfigClientUid(cfg)
-            val state = getConfigPlayerState(cfg)
-            val usage = getConfigUsage(cfg)
-            if (uid in targetUids && state == PLAYER_STATE_STARTED && PlaybackCaptureConfigBuilder.isMatchingMediaUsage(usage)) {
+        for (s in sessions) {
+            if (s.uid in targetUids && s.state == PLAYER_STATE_STARTED && PlaybackCaptureConfigBuilder.isMatchingMediaUsage(s.usage)) {
                 activeTargetCount++
-                val mask = getConfigMutedBy(cfg)
-                combinedMask = combinedMask or mask
-                if (isConfirmedMutedInMixer(mask)) {
+                combinedMask = combinedMask or s.mutedBy
+                if (isConfirmedMutedInMixer(s.mutedBy)) {
                     confirmedMutedCount++
                 }
             }
@@ -565,7 +767,7 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         }
 
         val remainingLeaseMs = if (leaseActive) {
-            (leaseExpiresAtElapsedMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+            (leaseExpiresAtElapsedMs - elapsedRealtimeProvider()).coerceAtLeast(0L)
         } else {
             0L
         }
@@ -576,6 +778,7 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
             .put("remainingLeaseMs", remainingLeaseMs)
             .put("activeTargetPlayerCount", activeTargetCount)
             .put("confirmedMutedPlayerCount", confirmedMutedCount)
+            .put("pendingRestoreCount", pendingRestoreCountLocked())
             .put("lastMixerMutedByMask", lastMixerMutedByMask)
             .put("lastMuteConfirmationLatencyMs", lastConfirmationLatencyMs)
             .put("maxObservedNewTrackMuteLatencyMs", maxObservedLatencyMs)
@@ -647,20 +850,18 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
     private fun onSystemPlaybackConfigsChanged(callbackEventNs: Long) {
         synchronized(lock) {
             if (!leaseActive || targetUids.isEmpty()) return
-            val configs = getActivePlaybackConfigurationsInternal()
-            for (cfg in configs) {
-                val uid = getConfigClientUid(cfg)
-                if (uid in targetUids &&
-                    getConfigPlayerState(cfg) == PLAYER_STATE_STARTED &&
-                    PlaybackCaptureConfigBuilder.isMatchingMediaUsage(getConfigUsage(cfg))
+            val sessions = getActivePlaybackSessionsInternal()
+            for (s in sessions) {
+                if (s.uid in targetUids &&
+                    s.state == PLAYER_STATE_STARTED &&
+                    PlaybackCaptureConfigBuilder.isMatchingMediaUsage(s.usage)
                 ) {
-                    val piid = getConfigPiid(cfg)
-                    firstSeenStartedNs.putIfAbsent(piid, callbackEventNs)
+                    firstSeenStartedNs.putIfAbsent(s.piid, callbackEventNs)
                 }
             }
             val err = enforceMuteOnActiveTargetSessionsLocked(targetUids)
             if (err != null) {
-                releaseMuteLeaseInternalLocked()
+                releaseMuteLeaseInternalLocked(resetRetryWindow = false)
                 notifyFailureCallbacks(err)
             } else {
                 notifyStateCallbacks(buildLeaseResponseLocked(success = true, error = null))
@@ -826,6 +1027,21 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         }
     }
 
+    private fun getActivePlaybackSessionsInternal(): List<PlaybackSessionDescriptor> {
+        playbackSessionsProvider?.let { return it.invoke() }
+        return getActivePlaybackConfigurationsInternal().map { cfg ->
+            PlaybackSessionDescriptor(
+                piid = getConfigPiid(cfg),
+                uid = getConfigClientUid(cfg),
+                state = getConfigPlayerState(cfg),
+                playerType = getConfigPlayerType(cfg),
+                usage = getConfigUsage(cfg),
+                mutedBy = getConfigMutedBy(cfg),
+                playerProxy = getConfigPlayerProxy(cfg)
+            )
+        }
+    }
+
     private fun getConfigClientUid(cfg: AudioPlaybackConfiguration): Int {
         return try {
             val m = cfg.javaClass.getMethod("getClientUid")
@@ -900,14 +1116,6 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         return (mutedByMask and (MUTED_BY_VOLUME_SHAPER or MUTED_BY_CLIENT_VOLUME)) != 0 ||
             mutedByMask != 0
     }
-
-    private data class ShellUserProfile(
-        val userId: Int,
-        val userSerialNumber: Long,
-        val label: String,
-        val profileType: ProfileType,
-        val isRunning: Boolean
-    )
 
     private fun queryUserProfilesInternal(): List<ShellUserProfile> {
         val results = mutableListOf<ShellUserProfile>()
@@ -1054,6 +1262,11 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         }
     }
 
+    private fun queryPackagesForUidSafe(fullUid: Int): List<String> {
+        onSharedUidQueriedHook?.invoke(fullUid)
+        return packagesForUidProvider?.invoke(fullUid) ?: queryPackagesForUidInternal(fullUid)
+    }
+
     private fun queryPackagesForUidInternal(fullUid: Int): List<String> {
         return try {
             val pm = getPackageManagerInterface() ?: return emptyList()
@@ -1065,16 +1278,21 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         }
     }
 
-    private fun isPlaybackCaptureAllowed(appInfo: ApplicationInfo): Boolean {
-        return try {
-            val m = ApplicationInfo::class.java.getMethod("isAudioPlaybackCaptureAllowed")
-            (m.invoke(appInfo) as? Boolean) ?: true
-        } catch (_: Throwable) {
-            true
+    private fun extractAppCategory(appInfo: ApplicationInfo): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            appInfo.category
+        } else {
+            ApplicationInfo.CATEGORY_UNDEFINED
         }
     }
 
+    private fun isAudioOrVideoCategory(category: Int): Boolean {
+        return category == ApplicationInfo.CATEGORY_AUDIO ||
+            category == ApplicationInfo.CATEGORY_VIDEO
+    }
+
     private fun loadAppLabelSafe(appInfo: ApplicationInfo): String {
+        onLabelLoadedHook?.invoke(appInfo.packageName)
         val nonLocalized = appInfo.nonLocalizedLabel?.toString()?.takeIf { it.isNotBlank() }
         if (nonLocalized != null) return nonLocalized
         return appInfo.packageName.substringAfterLast('.').replaceFirstChar { it.uppercase() }
@@ -1082,12 +1300,10 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
 
     private fun buildStatusReason(
         isProfileRunning: Boolean,
-        isInstalled: Boolean,
-        isCaptureRestricted: Boolean
+        isInstalled: Boolean
     ): String? {
         if (!isInstalled) return "应用未安装"
         if (!isProfileRunning) return "所属空间未运行或已锁定"
-        if (isCaptureRestricted) return "系统禁采 (allowAudioPlaybackCapture=false)"
         return null
     }
 
@@ -1095,10 +1311,14 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         const val DEDICATED_SHAPER_ID: Int = 0x53434D54 // "SCMT"
         const val OPERATION_FLAG_TERMINATE: Int = 1 shl 1
         const val MAX_LEASE_DURATION_MS: Long = 3_000L
+        const val RESTORE_RETRY_WINDOW_MS: Long = 3_000L
         const val MAX_CONFIRMATION_WAIT_MS: Long = 90L
         const val NEW_TRACK_GATE_LIMIT_MS: Long = 100L
 
+        const val PLAYER_STATE_RELEASED: Int = 0
         const val PLAYER_STATE_STARTED: Int = 2
+        const val PLAYER_STATE_PAUSED: Int = 3
+        const val PLAYER_STATE_STOPPED: Int = 4
         const val PLAYER_TYPE_JAM_AUDIOTRACK: Int = 1
         const val PLAYER_TYPE_JAM_MEDIAPLAYER: Int = 2
         const val PLAYER_TYPE_NATIVE_AUDIOTRACK: Int = 11

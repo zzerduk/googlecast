@@ -163,8 +163,10 @@ class MainActivity : FragmentActivity() {
                         }
                     },
                     onStartCastClicked = {
-                        if (viewModel.initiateStartCastFlow()) {
-                            launchPermissionsAndProjectionIfPrepared()
+                        lifecycleScope.launch {
+                            if (viewModel.initiateStartCastFlow()) {
+                                launchPermissionsAndProjectionIfPrepared()
+                            }
                         }
                     },
                     onStopCastClicked = { viewModel.stopAudioCast() },
@@ -190,15 +192,18 @@ class MainActivity : FragmentActivity() {
                     onSpeakerVolumeCommitted = { vol -> viewModel.setSpeakerVolume(vol) },
                     onSpeakerMuteToggled = { muted -> viewModel.setSpeakerMuted(muted) },
                     onSelectFallbackOutputMode = { chosenMode ->
-                        if (viewModel.confirmFallbackOutputModeAndPrepare(chosenMode)) {
-                            launchPermissionsAndProjectionIfPrepared()
+                        lifecycleScope.launch {
+                            if (viewModel.confirmFallbackOutputModeAndPrepare(chosenMode)) {
+                                launchPermissionsAndProjectionIfPrepared()
+                            }
                         }
                     },
                     onDismissOutputModeDialog = viewModel::dismissOutputModeDialog,
                     onConfirmRestoreLeftoverVolume = viewModel::confirmRestoreLeftoverMediaVolume,
                     onKeepCurrentVolumeOnRecovery = viewModel::dismissLeftoverMediaVolumeRecovery,
                     onRequestShizukuPermission = viewModel::requestShizukuPermission,
-                    onRefreshCatalog = viewModel::refreshTargetCatalog
+                    onRefreshCatalog = viewModel::refreshTargetCatalog,
+                    onSearchQueryChanged = viewModel::onSearchQueryChanged
                 )
             }
         }
@@ -206,6 +211,6 @@ class MainActivity : FragmentActivity() {
 
     override fun onResume() {
         super.onResume()
-        viewModel.refreshTargetCatalog()
+        viewModel.onAppResumed()
     }
 }

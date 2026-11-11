@@ -430,7 +430,7 @@ class WebRtcAudioCapture internal constructor(
      * immediately so hardware capture failure or pure silence never masquerades as valid capture.
      */
     internal object DefaultPlaybackAudioRecorderFactory : PlaybackAudioRecorderFactory {
-        @SuppressLint("MissingPermission")
+        @SuppressLint("MissingPermission", "NewApi")
         override fun create(
             projection: MediaProjection,
             sampleRate: Int,

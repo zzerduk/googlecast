@@ -44,6 +44,7 @@ data class LeaseAcquisitionOutcome(
     val success: Boolean,
     val activeTargetPlayerCount: Int = 0,
     val confirmedMutedPlayerCount: Int = 0,
+    val pendingRestoreCount: Int = 0,
     val lastMixerMutedByMask: Int = 0,
     val lastMuteConfirmationLatencyMs: Long? = null,
     val maxObservedNewTrackMuteLatencyMs: Long? = null,
@@ -54,10 +55,20 @@ interface ShizukuMuteBackend {
     val connectionState: StateFlow<ShizukuConnectionState>
     fun refreshShizukuStatus()
     fun requestPermission(requestCode: Int = 4101)
-    fun queryCatalog(context: Context, importedTargets: Set<CaptureTarget>): MultiProfileCatalogSnapshot
+    fun queryCatalog(
+        context: Context,
+        importedTargets: Set<CaptureTarget>,
+        includeOtherApps: Boolean = false
+    ): MultiProfileCatalogSnapshot
+    fun resolveTargetEntries(
+        context: Context,
+        targets: Set<CaptureTarget>
+    ): List<TargetAppEntry> = queryCatalog(context, targets, includeOtherApps = false)
+        .catalogApps
+        .filter { it.target in targets }
     fun resolveAndValidateTargets(context: Context, selectedTargets: Set<CaptureTarget>): TargetResolutionResult
     fun acquireOrRenewLease(targetUids: Set<Int>, leaseDurationMs: Long): LeaseAcquisitionOutcome
-    fun releaseLeaseImmediately()
+    fun releaseLeaseImmediately(): LeaseAcquisitionOutcome
     fun hasActiveStartedPlaybackForUids(targetUids: Set<Int>): Boolean
     fun addFailureListener(listener: (String) -> Unit)
     fun removeFailureListener(listener: (String) -> Unit)
@@ -74,6 +85,7 @@ object ShizukuSessionMuteController {
 
     const val LEASE_DURATION_MS: Long = 3_000L
     const val RENEWAL_INTERVAL_MS: Long = 1_000L
+    const val USER_SERVICE_PROTOCOL_VERSION: Int = 2
 
     private val controllerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var renewalJob: Job? = null
@@ -96,13 +108,20 @@ object ShizukuSessionMuteController {
                 ?: current.maxObservedNewTrackMuteLatencyMs
             val lastLat = outcome.lastMuteConfirmationLatencyMs?.takeIf { it >= 0L }
                 ?: current.lastMuteConfirmationLatencyMs
+            val updatedFailureReason = when {
+                !outcome.error.isNullOrBlank() -> outcome.error
+                outcome.pendingRestoreCount == 0 && outcome.success -> null
+                else -> current.muteFailureReason
+            }
             current.copy(
                 activeTargetPlayerCount = outcome.activeTargetPlayerCount,
                 confirmedMutedPlayerCount = outcome.confirmedMutedPlayerCount,
+                pendingRestoreCount = outcome.pendingRestoreCount,
                 lastMixerMutedByMask = outcome.lastMixerMutedByMask,
                 lastMuteConfirmationLatencyMs = lastLat,
                 maxObservedNewTrackMuteLatencyMs = maxLat,
-                isNewTrackLatencyWithinGate = maxLat?.let { it <= 100L } ?: current.isNewTrackLatencyWithinGate
+                isNewTrackLatencyWithinGate = maxLat?.let { it <= 100L } ?: current.isNewTrackLatencyWithinGate,
+                muteFailureReason = updatedFailureReason
             )
         }
     }
@@ -149,12 +168,29 @@ object ShizukuSessionMuteController {
         syncShizukuConnectionState()
     }
 
-    fun queryCatalog(context: Context, importedTargets: Set<CaptureTarget>): MultiProfileCatalogSnapshot {
+    fun queryCatalog(
+        context: Context,
+        importedTargets: Set<CaptureTarget>,
+        includeOtherApps: Boolean = false
+    ): MultiProfileCatalogSnapshot {
         syncShizukuConnectionState()
         return if (backend.connectionState.value == ShizukuConnectionState.READY) {
-            backend.queryCatalog(context, importedTargets)
+            backend.queryCatalog(context, importedTargets, includeOtherApps)
         } else {
-            PublicApiTargetResolver.queryCatalog(context, importedTargets)
+            PublicApiTargetResolver.queryCatalog(context, importedTargets, includeOtherApps)
+        }
+    }
+
+    fun resolveTargetEntries(
+        context: Context,
+        targets: Set<CaptureTarget>
+    ): List<TargetAppEntry> {
+        if (targets.isEmpty()) return emptyList()
+        syncShizukuConnectionState()
+        return if (backend.connectionState.value == ShizukuConnectionState.READY) {
+            backend.resolveTargetEntries(context, targets)
+        } else {
+            PublicApiTargetResolver.resolveTargetEntries(context, targets)
         }
     }
 
@@ -205,15 +241,23 @@ object ShizukuSessionMuteController {
         val initialOutcome = backend.acquireOrRenewLease(targetUids, LEASE_DURATION_MS)
         if (!initialOutcome.success) {
             val err = initialOutcome.error ?: "初始播放器会话静音确认失败。"
-            backend.releaseLeaseImmediately()
+            val releaseOutcome = if (initialOutcome.pendingRestoreCount > 0) {
+                initialOutcome
+            } else {
+                runCatching { backend.releaseLeaseImmediately() }.getOrDefault(initialOutcome)
+            }
             _muteTelemetry.update {
                 it.copy(
                     leaseActive = false,
                     resolvedTargetUids = emptySet(),
+                    pendingRestoreCount = releaseOutcome.pendingRestoreCount.coerceAtLeast(initialOutcome.pendingRestoreCount),
                     muteFailureReason = err
                 )
             }
-            return initialOutcome.copy(error = err)
+            return initialOutcome.copy(
+                pendingRestoreCount = releaseOutcome.pendingRestoreCount.coerceAtLeast(initialOutcome.pendingRestoreCount),
+                error = err
+            )
         }
 
         val initialLat = initialOutcome.lastMuteConfirmationLatencyMs?.takeIf { it >= 0L }
@@ -225,6 +269,7 @@ object ShizukuSessionMuteController {
                 resolvedTargetUids = targetUids,
                 activeTargetPlayerCount = initialOutcome.activeTargetPlayerCount,
                 confirmedMutedPlayerCount = initialOutcome.confirmedMutedPlayerCount,
+                pendingRestoreCount = initialOutcome.pendingRestoreCount,
                 lastMixerMutedByMask = initialOutcome.lastMixerMutedByMask,
                 lastMuteConfirmationLatencyMs = initialLat,
                 maxObservedNewTrackMuteLatencyMs = maxLat,
@@ -243,7 +288,7 @@ object ShizukuSessionMuteController {
                 val renewOutcome = backend.acquireOrRenewLease(targetUids, LEASE_DURATION_MS)
                 if (!renewOutcome.success) {
                     val err = renewOutcome.error ?: "会话静音租约续期或新轨静音确认失败。"
-                    onRemoteMuteFailure(err)
+                    onRemoteMuteFailure(err, releaseRemotelyAsync = true)
                     break
                 }
                 val latestLat = renewOutcome.lastMuteConfirmationLatencyMs?.takeIf { it >= 0L }
@@ -253,6 +298,7 @@ object ShizukuSessionMuteController {
                     current.copy(
                         activeTargetPlayerCount = renewOutcome.activeTargetPlayerCount,
                         confirmedMutedPlayerCount = renewOutcome.confirmedMutedPlayerCount,
+                        pendingRestoreCount = renewOutcome.pendingRestoreCount,
                         lastMixerMutedByMask = renewOutcome.lastMixerMutedByMask,
                         lastMuteConfirmationLatencyMs = latestLat ?: current.lastMuteConfirmationLatencyMs,
                         maxObservedNewTrackMuteLatencyMs = mergedMax,
@@ -267,20 +313,34 @@ object ShizukuSessionMuteController {
         return initialOutcome
     }
 
-    fun stopLeaseAndRestoreImmediately(failureReason: String? = null) {
+    fun stopLeaseAndRestoreImmediately(failureReason: String? = null): LeaseAcquisitionOutcome {
         val job = renewalJob
         renewalJob = null
         job?.cancel()
         sessionFailureHandler = null
-        runCatching { backend.releaseLeaseImmediately() }
+        val releaseOutcome = runCatching {
+            backend.releaseLeaseImmediately()
+        }.getOrElse { e ->
+            LeaseAcquisitionOutcome(
+                success = false,
+                error = "释放会话静音租约异常：${e.message}"
+            )
+        }
+        val effectiveError = when {
+            !releaseOutcome.success -> releaseOutcome.error ?: failureReason ?: "部分受控音频会话尚未确认恢复"
+            failureReason != null -> failureReason
+            else -> null
+        }
         _muteTelemetry.update { current ->
             current.copy(
                 leaseActive = false,
-                activeTargetPlayerCount = 0,
-                confirmedMutedPlayerCount = 0,
-                muteFailureReason = failureReason ?: current.muteFailureReason
+                activeTargetPlayerCount = releaseOutcome.activeTargetPlayerCount,
+                confirmedMutedPlayerCount = releaseOutcome.confirmedMutedPlayerCount,
+                pendingRestoreCount = releaseOutcome.pendingRestoreCount,
+                muteFailureReason = effectiveError ?: if (releaseOutcome.pendingRestoreCount > 0) current.muteFailureReason else null
             )
         }
+        return releaseOutcome.copy(error = effectiveError)
     }
 
     fun hasActiveStartedPlaybackForUids(targetUids: Set<Int>): Boolean {
@@ -302,9 +362,29 @@ object ShizukuSessionMuteController {
         }
     }
 
-    private fun onRemoteMuteFailure(reason: String) {
+    /**
+     * Handles remote mute failure notifications without synchronously calling back into
+     * `releaseMuteLease` on the incoming Binder callback stack.
+     */
+    private fun onRemoteMuteFailure(reason: String, releaseRemotelyAsync: Boolean = false) {
+        val job = renewalJob
+        renewalJob = null
+        job?.cancel()
         val handler = sessionFailureHandler
-        stopLeaseAndRestoreImmediately(failureReason = reason)
+        sessionFailureHandler = null
+        _muteTelemetry.update { current ->
+            current.copy(
+                leaseActive = false,
+                activeTargetPlayerCount = 0,
+                confirmedMutedPlayerCount = 0,
+                muteFailureReason = reason
+            )
+        }
+        if (releaseRemotelyAsync) {
+            controllerScope.launch {
+                stopLeaseAndRestoreImmediately(failureReason = reason)
+            }
+        }
         handler?.invoke(reason)
     }
 }
@@ -320,7 +400,7 @@ internal class RealShizukuMuteBackend : ShizukuMuteBackend {
     @Volatile private var remoteService: IShizukuAudioMuteService? = null
     @Volatile private var bindingInProgress: Boolean = false
 
-    private val shizukuCallback = object : IShizukuMuteCallback.Stub() {
+    internal val shizukuCallback = object : IShizukuMuteCallback.Stub() {
         override fun onSessionStateUpdated(jsonSnapshot: String?) {
             if (jsonSnapshot.isNullOrBlank()) return
             val parsed = parseLeaseOutcome(jsonSnapshot)
@@ -424,7 +504,7 @@ internal class RealShizukuMuteBackend : ShizukuMuteBackend {
                 .daemon(false)
                 .processNameSuffix("audio_mute_shell")
                 .debuggable(BuildConfig.DEBUG)
-                .version(BuildConfig.VERSION_CODE)
+                .version(BuildConfig.VERSION_CODE * 100 + ShizukuSessionMuteController.USER_SERVICE_PROTOCOL_VERSION)
             Shizuku.bindUserService(args, userServiceConnection)
         } catch (_: Throwable) {
             bindingInProgress = false
@@ -450,18 +530,19 @@ internal class RealShizukuMuteBackend : ShizukuMuteBackend {
 
     override fun queryCatalog(
         context: Context,
-        importedTargets: Set<CaptureTarget>
+        importedTargets: Set<CaptureTarget>,
+        includeOtherApps: Boolean
     ): MultiProfileCatalogSnapshot {
         val service = remoteService?.takeIf { it.asBinder().pingBinder() }
         if (service != null) {
             try {
                 val payload = importedTargets.map { it.toStorageKey() }
-                val rawJson = service.queryMultiProfileCatalog(payload)
+                val rawJson = service.queryMultiProfileCatalog(payload, includeOtherApps)
                 return enrichLabelsWithPackageManager(context, parseCatalogJson(rawJson))
             } catch (_: Throwable) {
             }
         }
-        return queryLocalFallbackCatalog(context, importedTargets)
+        return queryLocalFallbackCatalog(context, importedTargets, includeOtherApps)
     }
 
     override fun resolveAndValidateTargets(
@@ -510,9 +591,21 @@ internal class RealShizukuMuteBackend : ShizukuMuteBackend {
         }
     }
 
-    override fun releaseLeaseImmediately() {
-        val service = remoteService ?: return
-        runCatching { service.releaseMuteLease() }
+    override fun releaseLeaseImmediately(): LeaseAcquisitionOutcome {
+        val service = remoteService ?: return LeaseAcquisitionOutcome(success = true)
+        return try {
+            val raw = service.releaseMuteLease()
+            if (raw.isNullOrBlank()) {
+                LeaseAcquisitionOutcome(success = true)
+            } else {
+                parseLeaseOutcome(raw)
+            }
+        } catch (e: Throwable) {
+            LeaseAcquisitionOutcome(
+                success = false,
+                error = "Shizuku 释放会话静音失败：${e.message}"
+            )
+        }
     }
 
     override fun hasActiveStartedPlaybackForUids(targetUids: Set<Int>): Boolean {
@@ -542,7 +635,7 @@ internal class RealShizukuMuteBackend : ShizukuMuteBackend {
         stateListeners.remove(listener)
     }
 
-    private fun parseLeaseOutcome(rawJson: String): LeaseAcquisitionOutcome {
+    internal fun parseLeaseOutcome(rawJson: String): LeaseAcquisitionOutcome {
         return try {
             val obj = JSONObject(rawJson)
             val lastLat = obj.optLong("lastMuteConfirmationLatencyMs", -1L).takeIf { it >= 0L }
@@ -552,6 +645,7 @@ internal class RealShizukuMuteBackend : ShizukuMuteBackend {
                 success = obj.optBoolean("success", false),
                 activeTargetPlayerCount = obj.optInt("activeTargetPlayerCount", 0),
                 confirmedMutedPlayerCount = obj.optInt("confirmedMutedPlayerCount", 0),
+                pendingRestoreCount = obj.optInt("pendingRestoreCount", 0),
                 lastMixerMutedByMask = obj.optInt("lastMixerMutedByMask", 0),
                 lastMuteConfirmationLatencyMs = lastLat,
                 maxObservedNewTrackMuteLatencyMs = maxLat,
@@ -562,7 +656,7 @@ internal class RealShizukuMuteBackend : ShizukuMuteBackend {
         }
     }
 
-    private fun parseCatalogJson(rawJson: String): MultiProfileCatalogSnapshot {
+    internal fun parseCatalogJson(rawJson: String): MultiProfileCatalogSnapshot {
         val obj = JSONObject(rawJson)
         val profilesArr = obj.optJSONArray("profiles")
         val profiles = buildList {
@@ -605,6 +699,11 @@ internal class RealShizukuMuteBackend : ShizukuMuteBackend {
                     }
                     val uid = if (item.isNull("resolvedUid")) null else item.optInt("resolvedUid")
                     val reason = if (item.isNull("statusReason")) null else item.optString("statusReason").takeIf { it.isNotBlank() }
+                    val appCategory = if (item.has("appCategory") && !item.isNull("appCategory")) {
+                        item.optInt("appCategory", ApplicationInfo.CATEGORY_UNDEFINED)
+                    } else {
+                        ApplicationInfo.CATEGORY_UNDEFINED
+                    }
                     add(
                         TargetAppEntry(
                             target = CaptureTarget(pkg, serial),
@@ -614,9 +713,9 @@ internal class RealShizukuMuteBackend : ShizukuMuteBackend {
                             isInstalled = item.optBoolean("isInstalled", true),
                             isProfileRunning = item.optBoolean("isProfileRunning", true),
                             isSystemApp = item.optBoolean("isSystemApp", false),
+                            appCategory = appCategory,
                             resolvedUid = uid,
                             sharedUidPackages = siblings,
-                            isCaptureRestrictedByManifest = item.optBoolean("isCaptureRestricted", false),
                             statusReason = reason
                         )
                     )
@@ -712,8 +811,9 @@ internal class RealShizukuMuteBackend : ShizukuMuteBackend {
 
     private fun queryLocalFallbackCatalog(
         context: Context,
-        importedTargets: Set<CaptureTarget>
+        importedTargets: Set<CaptureTarget>,
+        includeOtherApps: Boolean
     ): MultiProfileCatalogSnapshot {
-        return PublicApiTargetResolver.queryCatalog(context, importedTargets)
+        return PublicApiTargetResolver.queryCatalog(context, importedTargets, includeOtherApps)
     }
 }

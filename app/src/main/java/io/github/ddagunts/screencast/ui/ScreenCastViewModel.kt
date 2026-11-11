@@ -27,11 +27,13 @@ import io.github.ddagunts.screencast.target.TargetAppEntry
 import io.github.ddagunts.screencast.target.TargetPreset
 import io.github.ddagunts.screencast.target.UserProfileInfo
 import io.github.ddagunts.screencast.webrtc.WebRtcStage
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class ScreenCastViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -67,11 +69,13 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
 
     init {
         CaptureTargetRepository.initialize(application)
-        PhoneGlobalMediaMuteController.initialize(
-            context = application,
-            isSessionCurrentlyActive = telemetry.value.isSessionActive
-        )
-        ShizukuSessionMuteController.syncShizukuConnectionState()
+        viewModelScope.launch(Dispatchers.IO) {
+            PhoneGlobalMediaMuteController.initialize(
+                context = application,
+                isSessionCurrentlyActive = telemetry.value.isSessionActive
+            )
+            ShizukuSessionMuteController.syncShizukuConnectionState()
+        }
         CastSdkSessionController.initialize(application, AudioCastSessionCoordinator::appendLog)
         viewModelScope.launch {
             combine(
@@ -109,14 +113,29 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
             current.webRtcStage == WebRtcStage.CLEANUP_TIMEOUT
     }
 
+    fun onAppResumed() {
+        viewModelScope.launch(Dispatchers.IO) {
+            ShizukuSessionMuteController.syncShizukuConnectionState()
+            CaptureTargetRepository.onAppResumed(getApplication())
+        }
+    }
+
     fun refreshTargetCatalog() {
-        ShizukuSessionMuteController.syncShizukuConnectionState()
-        CaptureTargetRepository.refreshCatalog(getApplication())
+        viewModelScope.launch(Dispatchers.IO) {
+            ShizukuSessionMuteController.syncShizukuConnectionState()
+            CaptureTargetRepository.refreshCatalog(getApplication())
+        }
+    }
+
+    fun onSearchQueryChanged(query: String) {
+        CaptureTargetRepository.onSearchQueryChanged(getApplication(), query)
     }
 
     fun requestShizukuPermission() {
-        ShizukuSessionMuteController.requestShizukuPermission()
-        CaptureTargetRepository.refreshCatalog(getApplication())
+        viewModelScope.launch(Dispatchers.IO) {
+            ShizukuSessionMuteController.requestShizukuPermission()
+            CaptureTargetRepository.refreshCatalog(getApplication())
+        }
     }
 
     fun toggleTargetAppSelection(target: CaptureTarget) {
@@ -208,13 +227,47 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun confirmRestoreLeftoverMediaVolume() {
-        PhoneGlobalMediaMuteController.confirmRestoreLeftoverVolume(getApplication())
-        AudioCastSessionCoordinator.appendLog("User confirmed restoring leftover global media volume.")
+        viewModelScope.launch(Dispatchers.IO) {
+            confirmRestoreLeftoverMediaVolumeSuspend()
+        }
+    }
+
+    suspend fun confirmRestoreLeftoverMediaVolumeSuspend(): Result<Unit> = withContext(Dispatchers.IO) {
+        val result = PhoneGlobalMediaMuteController.confirmRestoreLeftoverVolume(getApplication())
+        result.fold(
+            onSuccess = {
+                AudioCastSessionCoordinator.updateTelemetry { it.copy(error = null) }
+                AudioCastSessionCoordinator.appendLog("User confirmed restoring leftover global media volume.")
+            },
+            onFailure = { err ->
+                val msg = err.message ?: "恢复原媒体音量失败。"
+                AudioCastSessionCoordinator.updateTelemetry { it.copy(error = msg) }
+                AudioCastSessionCoordinator.appendLog("Leftover media volume restore failed: $msg")
+            }
+        )
+        result
     }
 
     fun dismissLeftoverMediaVolumeRecovery() {
-        PhoneGlobalMediaMuteController.dismissLeftoverRecoveryKeepCurrent(getApplication())
-        AudioCastSessionCoordinator.appendLog("User chose to keep current media volume and clear leftover record.")
+        viewModelScope.launch(Dispatchers.IO) {
+            dismissLeftoverMediaVolumeRecoverySuspend()
+        }
+    }
+
+    suspend fun dismissLeftoverMediaVolumeRecoverySuspend(): Result<Unit> = withContext(Dispatchers.IO) {
+        val result = PhoneGlobalMediaMuteController.dismissLeftoverRecoveryKeepCurrent(getApplication())
+        result.fold(
+            onSuccess = {
+                AudioCastSessionCoordinator.updateTelemetry { it.copy(error = null) }
+                AudioCastSessionCoordinator.appendLog("User chose to keep current media volume and clear leftover record.")
+            },
+            onFailure = { err ->
+                val msg = err.message ?: "清除媒体静音恢复记录失败。"
+                AudioCastSessionCoordinator.updateTelemetry { it.copy(error = msg) }
+                AudioCastSessionCoordinator.appendLog("Failed to clear leftover media volume record: $msg")
+            }
+        )
+        result
     }
 
     fun setGlobalMediaMuteCompatibility(compatible: Boolean, reason: String? = null) {
@@ -231,14 +284,25 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
 
     /**
      * Entry point when user clicks "Start Audio Cast":
+     * - Refuses to start if an unhandled global media mute recovery record exists.
      * - If Shizuku is `READY`, defaults to [PhoneOutputMode.SHIZUKU_SESSION_MUTE] and proceeds immediately.
      * - If Shizuku is unavailable or permission is not granted, opens the fallback output mode dialog
      *   so the user can explicitly choose between [PhoneOutputMode.GLOBAL_MEDIA_MUTE] and
      *   [PhoneOutputMode.CAPTURE_ONLY_UNMUTED].
      */
-    fun initiateStartCastFlow(requireConnectedCastReceiver: Boolean = true): Boolean {
+    suspend fun initiateStartCastFlow(requireConnectedCastReceiver: Boolean = true): Boolean {
         if (isCaptureLockedInProcess()) return false
         if (_isRequestingCapture.value || telemetry.value.isSessionActive) return false
+
+        val hasUnhandledRecovery = withContext(Dispatchers.IO) {
+            PhoneGlobalMediaMuteController.hasUnhandledRecoveryRecord(getApplication())
+        }
+        if (hasUnhandledRecovery) {
+            captureAuthorizationFailed(
+                "存在未处理的媒体音量恢复记录，请先在恢复弹窗中选择“恢复原音量”或“保留当前设置”后再启动新投放。"
+            )
+            return false
+        }
 
         val currentTargets = selectedTargets.value
         if (currentTargets.isEmpty()) {
@@ -254,7 +318,9 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
             return false
         }
 
-        ShizukuSessionMuteController.syncShizukuConnectionState()
+        withContext(Dispatchers.IO) {
+            ShizukuSessionMuteController.syncShizukuConnectionState()
+        }
         val shizukuState = muteTelemetry.value.shizukuState
         return if (shizukuState == ShizukuConnectionState.READY) {
             _showOutputModeDialog.value = false
@@ -268,7 +334,7 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    fun confirmFallbackOutputModeAndPrepare(
+    suspend fun confirmFallbackOutputModeAndPrepare(
         chosenMode: PhoneOutputMode,
         requireConnectedCastReceiver: Boolean = true
     ): Boolean {
@@ -279,7 +345,7 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         )
     }
 
-    fun prepareCaptureRequest(
+    suspend fun prepareCaptureRequest(
         requireConnectedCastReceiver: Boolean = true,
         outputMode: PhoneOutputMode = PhoneOutputMode.SHIZUKU_SESSION_MUTE
     ): Boolean {
@@ -289,28 +355,20 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         if (_isRequestingCapture.value || telemetry.value.isSessionActive) {
             return false
         }
-        val currentTargets = selectedTargets.value
-        if (currentTargets.isEmpty()) {
-            captureAuthorizationFailed("请先添加并至少勾选 1 个要投音的目标应用（空目标禁止启动）。")
-            return false
-        }
 
-        ShizukuSessionMuteController.syncShizukuConnectionState()
-        val shizukuState = muteTelemetry.value.shizukuState
-        if (outputMode == PhoneOutputMode.SHIZUKU_SESSION_MUTE &&
-            shizukuState != ShizukuConnectionState.READY
-        ) {
+        val hasUnhandledRecovery = withContext(Dispatchers.IO) {
+            PhoneGlobalMediaMuteController.hasUnhandledRecoveryRecord(getApplication())
+        }
+        if (hasUnhandledRecovery) {
             captureAuthorizationFailed(
-                "Shizuku Shell 服务未就绪 (${shizukuState.statusLabel})，无法执行定向静音，请授权 Shizuku 或选择备选输出模式。"
+                "存在未处理的媒体音量恢复记录，请先在恢复弹窗中选择“恢复原音量”或“保留当前设置”后再启动新投放。"
             )
             return false
         }
-        if (outputMode == PhoneOutputMode.GLOBAL_MEDIA_MUTE &&
-            !PhoneGlobalMediaMuteController.isGlobalMediaMuteCompatible.value
-        ) {
-            val disabledReason = PhoneGlobalMediaMuteController.globalMediaMuteDisabledReason.value
-                ?: "本机整体媒体静音会导致系统回采静音，已禁用该选项，请选择“仅采集不静音”。"
-            captureAuthorizationFailed(disabledReason)
+
+        val currentTargets = selectedTargets.value
+        if (currentTargets.isEmpty()) {
+            captureAuthorizationFailed("请先添加并至少勾选 1 个要投音的目标应用（空目标禁止启动）。")
             return false
         }
 
@@ -330,20 +388,46 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
             }
         }
 
-        // Freeze selected CaptureTarget snapshot and PhoneOutputMode at authorization time & validate immediately
+        // Freeze selected CaptureTarget snapshot and lock target editing immediately before preflight IO
         CaptureTargetRepository.freezeSelectedTargetsSnapshot(outputMode)
-        val preflightCheck = CaptureTargetRepository.resolveAndValidateFrozenTargets(
-            context = getApplication(),
-            outputModeOverride = outputMode
-        )
+        _isRequestingCapture.value = true
+        computeEditingLockedNow()
+
+        withContext(Dispatchers.IO) {
+            ShizukuSessionMuteController.syncShizukuConnectionState()
+        }
+        val shizukuState = muteTelemetry.value.shizukuState
+        if (outputMode == PhoneOutputMode.SHIZUKU_SESSION_MUTE &&
+            shizukuState != ShizukuConnectionState.READY
+        ) {
+            captureAuthorizationFailed(
+                "Shizuku Shell 服务未就绪 (${shizukuState.statusLabel})，无法执行定向静音，请授权 Shizuku 或选择备选输出模式。"
+            )
+            return false
+        }
+        if (outputMode == PhoneOutputMode.GLOBAL_MEDIA_MUTE &&
+            !PhoneGlobalMediaMuteController.isGlobalMediaMuteCompatible.value
+        ) {
+            val disabledReason = PhoneGlobalMediaMuteController.globalMediaMuteDisabledReason.value
+                ?: "本机整体媒体静音会导致系统回采静音，已禁用该选项，请选择“仅采集不静音”。"
+            captureAuthorizationFailed(disabledReason)
+            return false
+        }
+
+        val preflightCheck = try {
+            CaptureTargetRepository.resolveAndValidateFrozenTargets(
+                context = getApplication(),
+                outputModeOverride = outputMode
+            )
+        } catch (e: Throwable) {
+            captureAuthorizationFailed(e.message ?: "所选目标应用校验异常。")
+            return false
+        }
         if (!preflightCheck.isValid) {
-            CaptureTargetRepository.clearFrozenTargetsSnapshot()
             captureAuthorizationFailed(preflightCheck.failureReason ?: "所选目标应用校验未通过。")
             return false
         }
 
-        _isRequestingCapture.value = true
-        computeEditingLockedNow()
         AudioCastSessionCoordinator.updateTelemetry {
             it.copy(
                 activeOutputMode = outputMode,
@@ -357,12 +441,31 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         val channel = requestedChannel
         requestedChannel = null
         _isRequestingCapture.value = false
-        ShizukuSessionMuteController.stopLeaseAndRestoreImmediately(message)
-        PhoneGlobalMediaMuteController.restorePhoneAudioIfNeeded(getApplication())
         CaptureTargetRepository.clearFrozenTargetsSnapshot()
         computeEditingLockedNow()
-        if (!isCaptureLockedInProcess()) {
-            AudioCastSessionCoordinator.updateTelemetry { it.copy(error = message) }
+        val (completedImmediate, immediateRestoreErr) = AudioCastSessionCoordinator.tryRestorePhoneAudioImmediate(
+            appContext = getApplication(),
+            failureReason = message
+        )
+        if (completedImmediate) {
+            val combinedMsg = AudioCastSessionCoordinator.combineErrorMessages(message, immediateRestoreErr) ?: message
+            if (!isCaptureLockedInProcess()) {
+                AudioCastSessionCoordinator.updateTelemetry { it.copy(error = combinedMsg) }
+            }
+        } else {
+            if (!isCaptureLockedInProcess()) {
+                AudioCastSessionCoordinator.updateTelemetry { it.copy(error = message) }
+            }
+            viewModelScope.launch(Dispatchers.IO) {
+                val restoreError = AudioCastSessionCoordinator.restorePhoneAudioSerialized(
+                    appContext = getApplication(),
+                    failureReason = message
+                )
+                val combinedMsg = AudioCastSessionCoordinator.combineErrorMessages(message, restoreError) ?: message
+                if (!isCaptureLockedInProcess()) {
+                    AudioCastSessionCoordinator.updateTelemetry { it.copy(error = combinedMsg) }
+                }
+            }
         }
         AudioCastSessionCoordinator.appendLog(message)
         channel?.endSession()
@@ -432,18 +535,27 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
     fun stopAudioCast() {
         requestedChannel = null
         _isRequestingCapture.value = false
-        // Immediate non-blocking restoration of phone audio (Shizuku session shaper or Global Media Mute)
-        ShizukuSessionMuteController.stopLeaseAndRestoreImmediately()
-        PhoneGlobalMediaMuteController.restorePhoneAudioIfNeeded(getApplication())
+        val wasSessionActive = telemetry.value.isSessionActive
         CaptureTargetRepository.clearFrozenTargetsSnapshot()
         computeEditingLockedNow()
         if (isCaptureLockedInProcess()) {
+            viewModelScope.launch(Dispatchers.IO) {
+                AudioCastSessionCoordinator.restorePhoneAudioSerialized(getApplication(), null)
+            }
             CastSdkSessionController.endSession()
             return
         }
-        if (!telemetry.value.isSessionActive) {
+        if (!wasSessionActive) {
+            viewModelScope.launch(Dispatchers.IO) {
+                val restoreErr = AudioCastSessionCoordinator.restorePhoneAudioSerialized(getApplication(), null)
+                AudioCastSessionCoordinator.updateTelemetry {
+                    AudioPipelineTelemetry(
+                        webRtcStage = if (restoreErr != null) WebRtcStage.ERROR else WebRtcStage.IDLE,
+                        error = restoreErr
+                    )
+                }
+            }
             CastSdkSessionController.endSession()
-            AudioCastSessionCoordinator.updateTelemetry { AudioPipelineTelemetry() }
             return
         }
         val app = getApplication<Application>()
@@ -453,8 +565,15 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         try {
             app.startService(stopIntent)
         } catch (e: Exception) {
-            AudioCastSessionCoordinator.updateTelemetry {
-                it.copy(error = e.message ?: "The capture service could not be stopped.")
+            viewModelScope.launch(Dispatchers.IO) {
+                val restoreErr = AudioCastSessionCoordinator.restorePhoneAudioSerialized(getApplication(), e.message)
+                val combined = AudioCastSessionCoordinator.combineErrorMessages(
+                    e.message ?: "The capture service could not be stopped.",
+                    restoreErr
+                )
+                AudioCastSessionCoordinator.updateTelemetry {
+                    it.copy(error = combined)
+                }
             }
         }
     }

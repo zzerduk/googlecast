@@ -30,17 +30,23 @@ interface PublicTargetEnvironment {
         val appLabel: String,
         val uid: Int,
         val isSystemApp: Boolean,
-        val isCaptureAllowed: Boolean,
         val isLaunchable: Boolean,
         /**
          * Complete list of packages sharing [uid] in this profile if verifiable via public API,
          * or `null` if public APIs cannot verify shared-UID completeness for this target/profile.
          */
-        val verifiedSharedUidPackages: List<String>?
+        val verifiedSharedUidPackages: List<String>?,
+        val appCategory: Int = ApplicationInfo.CATEGORY_UNDEFINED
     )
 
     fun queryAccessibleProfiles(context: Context): List<AccessibleProfile>
     fun queryLaunchableAppsInProfile(context: Context, userSerialNumber: Long): List<PublicAppMetadata>
+    fun queryLaunchableAppsInProfile(
+        context: Context,
+        userSerialNumber: Long,
+        includeOtherApps: Boolean,
+        importedTargets: Set<CaptureTarget>
+    ): List<PublicAppMetadata> = queryLaunchableAppsInProfile(context, userSerialNumber)
     fun resolveTargetApp(context: Context, target: CaptureTarget): PublicAppMetadata?
 }
 
@@ -53,7 +59,8 @@ interface PublicTargetEnvironment {
  * - Never guesses or synthesizes UIDs (`userId * 100000 + appId`).
  * - Retains inaccessible, identity-unverifiable, or shared-UID-unverifiable targets with explicit
  *   reasons instead of silently dropping them or expanding capture scope.
- * - Does not expand the default searchable catalog into all non-playback/non-launchable system packages.
+ * - Filters default catalog to audio/video categories plus imported/selected/preset target pool
+ *   before loading labels or querying shared UIDs.
  */
 object PublicApiTargetResolver {
 
@@ -62,12 +69,14 @@ object PublicApiTargetResolver {
         internal set
 
     internal fun resetEnvironmentForTesting() {
+        AndroidPublicTargetEnvironment.resetHooksForTesting()
         environment = AndroidPublicTargetEnvironment
     }
 
     fun queryCatalog(
         context: Context,
-        importedTargets: Set<CaptureTarget>
+        importedTargets: Set<CaptureTarget>,
+        includeOtherApps: Boolean = false
     ): MultiProfileCatalogSnapshot {
         val accessibleProfiles = environment.queryAccessibleProfiles(context)
         val profileBySerial = accessibleProfiles.associateBy { it.userSerialNumber }
@@ -106,12 +115,24 @@ object PublicApiTargetResolver {
         val seenSearchableKeys = HashSet<String>()
         val seenCatalogKeys = HashSet<String>()
 
-        // Default directory in fallback mode: ONLY launchable apps in accessible running profiles
+        // Default directory in fallback mode: launchable audio/video apps (plus pool targets) in accessible running profiles;
+        // when includeOtherApps=true (on-demand search), includes all launchable apps in accessible running profiles.
         for (profile in accessibleProfiles) {
             if (!profile.isRunning) continue
-            val launchable = environment.queryLaunchableAppsInProfile(context, profile.userSerialNumber)
+            val launchable = environment.queryLaunchableAppsInProfile(
+                context = context,
+                userSerialNumber = profile.userSerialNumber,
+                includeOtherApps = includeOtherApps,
+                importedTargets = importedTargets
+            )
             for (meta in launchable) {
                 val target = CaptureTarget(meta.packageName, profile.userSerialNumber)
+                if (!includeOtherApps &&
+                    !isAudioOrVideoAppCategory(meta.appCategory) &&
+                    target !in importedTargets
+                ) {
+                    continue
+                }
                 val entry = buildEntryFromMetadata(profile, meta)
                 if (seenSearchableKeys.add(target.toStorageKey())) {
                     searchableApps.add(entry)
@@ -125,72 +146,11 @@ object PublicApiTargetResolver {
         // Evaluate all imported/selected targets, retaining inaccessible or unverifiable ones with clear reasons
         for (target in importedTargets) {
             if (!seenCatalogKeys.add(target.toStorageKey())) continue
-            val profile = profileBySerial[target.userSerialNumber]
-            if (profile == null) {
-                catalogApps.add(
-                    TargetAppEntry(
-                        target = target,
-                        appLabel = target.packageName,
-                        profileType = ProfileType.OTHER,
-                        profileLabel = "空间 #${target.userSerialNumber} (不可访问)",
-                        isInstalled = true,
-                        isProfileRunning = false,
-                        isSystemApp = false,
-                        resolvedUid = null,
-                        sharedUidPackages = emptyList(),
-                        isCaptureRestrictedByManifest = false,
-                        isIdentityVerified = false,
-                        isSharedUidVerified = false,
-                        statusReason = "无 Shizuku 时无法访问或核验该空间 (Serial ${target.userSerialNumber}) 的目标身份"
-                    )
-                )
-                continue
+            val entry = resolveSingleImportedTargetEntry(context, target, profileBySerial)
+            catalogApps.add(entry)
+            if (entry.isInstalled && entry.isProfileRunning && seenSearchableKeys.add(target.toStorageKey())) {
+                searchableApps.add(entry)
             }
-
-            if (!profile.isRunning) {
-                catalogApps.add(
-                    TargetAppEntry(
-                        target = target,
-                        appLabel = target.packageName,
-                        profileType = profile.profileType,
-                        profileLabel = profile.label,
-                        isInstalled = true,
-                        isProfileRunning = false,
-                        isSystemApp = false,
-                        resolvedUid = null,
-                        sharedUidPackages = emptyList(),
-                        isCaptureRestrictedByManifest = false,
-                        isIdentityVerified = false,
-                        isSharedUidVerified = false,
-                        statusReason = "目标所属空间 (${profile.label}) 未运行或已开启安静模式"
-                    )
-                )
-                continue
-            }
-
-            val meta = environment.resolveTargetApp(context, target)
-            if (meta == null) {
-                catalogApps.add(
-                    TargetAppEntry(
-                        target = target,
-                        appLabel = target.packageName,
-                        profileType = profile.profileType,
-                        profileLabel = profile.label,
-                        isInstalled = false,
-                        isProfileRunning = true,
-                        isSystemApp = false,
-                        resolvedUid = null,
-                        sharedUidPackages = emptyList(),
-                        isCaptureRestrictedByManifest = false,
-                        isIdentityVerified = false,
-                        isSharedUidVerified = false,
-                        statusReason = "应用在 ${profile.label} 中未安装或公开 API 无法核验其身份"
-                    )
-                )
-                continue
-            }
-
-            catalogApps.add(buildEntryFromMetadata(profile, meta))
         }
 
         return MultiProfileCatalogSnapshot(
@@ -198,6 +158,82 @@ object PublicApiTargetResolver {
             catalogApps = catalogApps.sortedWith(compareBy({ it.profileType.ordinal }, { it.appLabel.lowercase() })),
             searchableApps = searchableApps.sortedWith(compareBy({ it.isSystemApp }, { it.profileType.ordinal }, { it.appLabel.lowercase() }))
         )
+    }
+
+    fun resolveTargetEntries(
+        context: Context,
+        targets: Set<CaptureTarget>
+    ): List<TargetAppEntry> {
+        if (targets.isEmpty()) return emptyList()
+        val accessibleProfiles = environment.queryAccessibleProfiles(context)
+        val profileBySerial = accessibleProfiles.associateBy { it.userSerialNumber }
+        return targets.map { target ->
+            resolveSingleImportedTargetEntry(context, target, profileBySerial)
+        }
+    }
+
+    private fun resolveSingleImportedTargetEntry(
+        context: Context,
+        target: CaptureTarget,
+        profileBySerial: Map<Long, PublicTargetEnvironment.AccessibleProfile>
+    ): TargetAppEntry {
+        val profile = profileBySerial[target.userSerialNumber]
+        if (profile == null) {
+            return TargetAppEntry(
+                target = target,
+                appLabel = target.packageName,
+                profileType = ProfileType.OTHER,
+                profileLabel = "空间 #${target.userSerialNumber} (不可访问)",
+                isInstalled = true,
+                isProfileRunning = false,
+                isSystemApp = false,
+                resolvedUid = null,
+                sharedUidPackages = emptyList(),
+                isIdentityVerified = false,
+                isSharedUidVerified = false,
+                statusReason = "无 Shizuku 时无法访问或核验该空间 (Serial ${target.userSerialNumber}) 的目标身份",
+                appCategory = ApplicationInfo.CATEGORY_UNDEFINED
+            )
+        }
+
+        if (!profile.isRunning) {
+            return TargetAppEntry(
+                target = target,
+                appLabel = target.packageName,
+                profileType = profile.profileType,
+                profileLabel = profile.label,
+                isInstalled = true,
+                isProfileRunning = false,
+                isSystemApp = false,
+                resolvedUid = null,
+                sharedUidPackages = emptyList(),
+                isIdentityVerified = false,
+                isSharedUidVerified = false,
+                statusReason = "目标所属空间 (${profile.label}) 未运行或已开启安静模式",
+                appCategory = ApplicationInfo.CATEGORY_UNDEFINED
+            )
+        }
+
+        val meta = environment.resolveTargetApp(context, target)
+        if (meta == null) {
+            return TargetAppEntry(
+                target = target,
+                appLabel = target.packageName,
+                profileType = profile.profileType,
+                profileLabel = profile.label,
+                isInstalled = false,
+                isProfileRunning = true,
+                isSystemApp = false,
+                resolvedUid = null,
+                sharedUidPackages = emptyList(),
+                isIdentityVerified = false,
+                isSharedUidVerified = false,
+                statusReason = "应用在 ${profile.label} 中未安装或公开 API 无法核验其身份",
+                appCategory = ApplicationInfo.CATEGORY_UNDEFINED
+            )
+        }
+
+        return buildEntryFromMetadata(profile, meta)
     }
 
     fun resolveAndValidateTargets(
@@ -238,12 +274,6 @@ object PublicApiTargetResolver {
             if (meta == null || meta.uid <= 0) {
                 unavailableTargets.add(
                     target to "${target.packageName} (${profile.label}): 应用未安装或无法通过公开 API 核验真实 UID"
-                )
-                continue
-            }
-            if (!meta.isCaptureAllowed) {
-                unavailableTargets.add(
-                    target to "${target.packageName} (${profile.label}): 应用声明了 allowAudioPlaybackCapture=false 禁止系统回采"
                 )
                 continue
             }
@@ -298,13 +328,11 @@ object PublicApiTargetResolver {
         meta: PublicTargetEnvironment.PublicAppMetadata
     ): TargetAppEntry {
         val target = CaptureTarget(meta.packageName, profile.userSerialNumber)
-        val isRestricted = !meta.isCaptureAllowed
         val verifiedSiblings = meta.verifiedSharedUidPackages
         val isSharedVerified = verifiedSiblings != null && meta.packageName in verifiedSiblings
         val reason = when {
             !profile.isRunning -> "所属空间未运行或已暂停"
             meta.uid <= 0 -> "无法核验完整 UID"
-            isRestricted -> "系统禁采 (allowAudioPlaybackCapture=false)"
             !isSharedVerified -> "无 Shizuku 时无法通过公开 API 完整校验共享 UID"
             else -> null
         }
@@ -318,15 +346,26 @@ object PublicApiTargetResolver {
             isSystemApp = meta.isSystemApp,
             resolvedUid = meta.uid.takeIf { it > 0 },
             sharedUidPackages = verifiedSiblings.orEmpty(),
-            isCaptureRestrictedByManifest = isRestricted,
             isIdentityVerified = meta.uid > 0,
             isSharedUidVerified = isSharedVerified,
-            statusReason = reason
+            statusReason = reason,
+            appCategory = meta.appCategory
         )
     }
 }
 
 internal object AndroidPublicTargetEnvironment : PublicTargetEnvironment {
+
+    @Volatile
+    var onLabelLoadedHookForTesting: ((String) -> Unit)? = null
+
+    @Volatile
+    var onSharedUidQueriedHookForTesting: ((String, Int) -> Unit)? = null
+
+    internal fun resetHooksForTesting() {
+        onLabelLoadedHookForTesting = null
+        onSharedUidQueriedHookForTesting = null
+    }
 
     private data class ResolvedUserHandle(
         val handle: UserHandle,
@@ -340,7 +379,9 @@ internal object AndroidPublicTargetEnvironment : PublicTargetEnvironment {
 
         val rawHandles = LinkedHashSet<UserHandle>()
         rawHandles.add(myHandle)
-        runCatching { launcherApps?.profiles?.let { rawHandles.addAll(it) } }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            runCatching { launcherApps?.profiles?.let { rawHandles.addAll(it) } }
+        }
         runCatching { userManager?.userProfiles?.let { rawHandles.addAll(it) } }
 
         val results = mutableListOf<ResolvedUserHandle>()
@@ -403,6 +444,20 @@ internal object AndroidPublicTargetEnvironment : PublicTargetEnvironment {
         context: Context,
         userSerialNumber: Long
     ): List<PublicTargetEnvironment.PublicAppMetadata> {
+        return queryLaunchableAppsInProfile(
+            context = context,
+            userSerialNumber = userSerialNumber,
+            includeOtherApps = true,
+            importedTargets = emptySet()
+        )
+    }
+
+    override fun queryLaunchableAppsInProfile(
+        context: Context,
+        userSerialNumber: Long,
+        includeOtherApps: Boolean,
+        importedTargets: Set<CaptureTarget>
+    ): List<PublicTargetEnvironment.PublicAppMetadata> {
         val resolved = discoverAccessibleHandles(context)
             .firstOrNull { it.profile.userSerialNumber == userSerialNumber }
             ?: return emptyList()
@@ -420,6 +475,12 @@ internal object AndroidPublicTargetEnvironment : PublicTargetEnvironment {
             val appInfo = activityInfo.applicationInfo ?: continue
             val pkg = appInfo.packageName ?: continue
             if (!seenPackages.add(pkg)) continue
+            val target = CaptureTarget(pkg, userSerialNumber)
+            val category = readApplicationCategory(appInfo)
+            if (!includeOtherApps && !isAudioOrVideoAppCategory(category) && target !in importedTargets) {
+                continue
+            }
+            onLabelLoadedHookForTesting?.invoke(pkg)
             val label = runCatching { activityInfo.label?.toString() }.getOrNull()
                 ?.takeIf { it.isNotBlank() }
                 ?: loadAppLabel(context.packageManager, appInfo, pkg)
@@ -436,9 +497,9 @@ internal object AndroidPublicTargetEnvironment : PublicTargetEnvironment {
                     appLabel = label,
                     uid = appInfo.uid,
                     isSystemApp = isSystemApp(appInfo),
-                    isCaptureAllowed = isAudioPlaybackCaptureAllowed(appInfo),
                     isLaunchable = true,
-                    verifiedSharedUidPackages = sharedPackages
+                    verifiedSharedUidPackages = sharedPackages,
+                    appCategory = category
                 )
             )
         }
@@ -457,14 +518,20 @@ internal object AndroidPublicTargetEnvironment : PublicTargetEnvironment {
         val pm = context.packageManager
         val launcherApps = context.getSystemService(Context.LAUNCHER_APPS_SERVICE) as? LauncherApps
 
-        val appInfo: ApplicationInfo = runCatching {
-            launcherApps?.getApplicationInfo(target.packageName, 0, resolved.handle)
-        }.getOrNull() ?: if (resolved.profile.isCurrentProcessUser) {
+        val appInfo: ApplicationInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            runCatching {
+                launcherApps?.getApplicationInfo(target.packageName, 0, resolved.handle)
+            }.getOrNull()
+        } else {
+            null
+        } ?: if (resolved.profile.isCurrentProcessUser) {
             runCatching { pm.getApplicationInfo(target.packageName, 0) }.getOrNull()
         } else {
             null
         } ?: return null
 
+        val category = readApplicationCategory(appInfo)
+        onLabelLoadedHookForTesting?.invoke(target.packageName)
         val label = loadAppLabel(pm, appInfo, target.packageName)
         val sharedPackages = resolveVerifiedSharedUidPackages(
             context = context,
@@ -478,9 +545,9 @@ internal object AndroidPublicTargetEnvironment : PublicTargetEnvironment {
             appLabel = label,
             uid = appInfo.uid,
             isSystemApp = isSystemApp(appInfo),
-            isCaptureAllowed = isAudioPlaybackCaptureAllowed(appInfo),
             isLaunchable = true,
-            verifiedSharedUidPackages = sharedPackages
+            verifiedSharedUidPackages = sharedPackages,
+            appCategory = category
         )
     }
 
@@ -490,6 +557,7 @@ internal object AndroidPublicTargetEnvironment : PublicTargetEnvironment {
         fullUid: Int,
         isCurrentProcessUser: Boolean
     ): List<String>? {
+        onSharedUidQueriedHookForTesting?.invoke(pkg, fullUid)
         if (fullUid <= 0) return null
         val pm = context.packageManager
         val fromGetPackages = runCatching {
@@ -553,12 +621,5 @@ internal object AndroidPublicTargetEnvironment : PublicTargetEnvironment {
     private fun isSystemApp(appInfo: ApplicationInfo): Boolean {
         return (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 &&
             (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
-    }
-
-    private fun isAudioPlaybackCaptureAllowed(appInfo: ApplicationInfo): Boolean {
-        return runCatching {
-            val m = ApplicationInfo::class.java.getMethod("isAudioPlaybackCaptureAllowed")
-            (m.invoke(appInfo) as? Boolean) ?: true
-        }.getOrDefault(true)
     }
 }

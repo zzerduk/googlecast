@@ -122,7 +122,8 @@ fun ScreenCastAudioScreen(
     onConfirmRestoreLeftoverVolume: () -> Unit = {},
     onKeepCurrentVolumeOnRecovery: () -> Unit = {},
     onRequestShizukuPermission: () -> Unit = {},
-    onRefreshCatalog: () -> Unit = {}
+    onRefreshCatalog: () -> Unit = {},
+    onSearchQueryChanged: (String) -> Unit = {}
 ) {
     var showAppPickerSheet by rememberSaveable { mutableStateOf(false) }
 
@@ -153,6 +154,7 @@ fun ScreenCastAudioScreen(
                         muteTelemetry = muteTelemetry,
                         selectedTargetsCount = selectedTargets.size,
                         isRequestingCapture = isRequestingCapture,
+                        hasPendingGlobalMuteRecovery = pendingGlobalMuteRecovery != null,
                         castButton = castButton,
                         onRequestShizukuPermission = onRequestShizukuPermission,
                         onStartCastClicked = onStartCastClicked,
@@ -206,13 +208,17 @@ fun ScreenCastAudioScreen(
             searchableApps = searchableApps,
             importedTargets = importedTargets,
             selectedTargets = selectedTargets,
-            onDismiss = { showAppPickerSheet = false },
+            onDismiss = {
+                onSearchQueryChanged("")
+                showAppPickerSheet = false
+            },
             onAddTargetApp = { pkg, serial ->
                 onImportTargetApp(pkg, serial)
             },
             onRemoveTargetApp = { target ->
                 onRemoveImportedTarget(target)
-            }
+            },
+            onSearchQueryChanged = onSearchQueryChanged
         )
     }
 
@@ -230,6 +236,7 @@ fun ScreenCastAudioScreen(
     if (pendingGlobalMuteRecovery != null) {
         LeftoverGlobalMuteRecoveryDialog(
             recovery = pendingGlobalMuteRecovery,
+            errorReason = telemetry.error,
             onRestoreOriginal = onConfirmRestoreLeftoverVolume,
             onKeepCurrent = onKeepCurrentVolumeOnRecovery
         )
@@ -245,6 +252,7 @@ private fun WebRtcConsoleHeaderCard(
     muteTelemetry: SessionMuteTelemetry,
     selectedTargetsCount: Int,
     isRequestingCapture: Boolean,
+    hasPendingGlobalMuteRecovery: Boolean = false,
     castButton: @Composable () -> Unit,
     onRequestShizukuPermission: () -> Unit,
     onStartCastClicked: () -> Unit,
@@ -627,6 +635,7 @@ private fun WebRtcConsoleHeaderCard(
                         onClick = onStartCastClicked,
                         enabled = !isRequestingCapture &&
                             !isCaptureLocked &&
+                            !hasPendingGlobalMuteRecovery &&
                             Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
                             castStatus.isConnected,
                         modifier = Modifier
@@ -1042,6 +1051,7 @@ private fun FallbackOutputModeSelectionDialog(
 @Composable
 private fun LeftoverGlobalMuteRecoveryDialog(
     recovery: PendingGlobalMuteRecovery,
+    errorReason: String? = null,
     onRestoreOriginal: () -> Unit,
     onKeepCurrent: () -> Unit
 ) {
@@ -1058,7 +1068,7 @@ private fun LeftoverGlobalMuteRecoveryDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    text = "上次使用「整体媒体静音」投音期间应用异常终止，为避免擅自覆盖您当前的音量设置，请选择处理方式：",
+                    text = "上次使用「整体媒体静音」投音期间应用异常终止或恢复未完成，为避免擅自覆盖您当前的音量设置，请选择处理方式：",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1073,6 +1083,14 @@ private fun LeftoverGlobalMuteRecoveryDialog(
                     style = MaterialTheme.typography.labelMedium,
                     fontFamily = FontFamily.Monospace
                 )
+                if (!errorReason.isNullOrBlank()) {
+                    Text(
+                        text = "恢复状态说明：$errorReason",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.testTag("recovery_dialog_error_reason")
+                    )
+                }
             }
         },
         confirmButton = {

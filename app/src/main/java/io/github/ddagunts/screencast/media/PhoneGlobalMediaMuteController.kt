@@ -56,10 +56,13 @@ internal object AndroidSystemMediaAudioAdapter : SystemMediaAudioAdapter {
 /**
  * Manages the `GLOBAL_MEDIA_MUTE` fallback mode using normal `MODIFY_AUDIO_SETTINGS` permission:
  * 1. Synchronously persists original `STREAM_MUSIC` volume & mute state BEFORE setting volume to 0.
- * 2. Restores phone audio FIRST on normal stop, startup failure, disconnect, or revocation;
- *    if the user manually raised media volume to non-zero (`> 0`) during casting, preserves the user's new setting.
- * 3. If a leftover record from a force-killed process is found on reopen, exposes [pendingRecovery]
- *    for user confirmation ("恢复原音量" vs "保留当前设置") without writing back behind the user's back.
+ * 2. Distinguishes "mode engaged" ([inProcessSessionEngaged]) from "this service modified volume"
+ *    ([inProcessModifiedAudio]); if the phone is already muted before start, does not zero volume
+ *    or write a recovery record, and leaves original system state untouched on stop.
+ * 3. Restores phone audio FIRST on normal stop, startup failure, disconnect, or revocation,
+ *    clearing the persisted record only after confirming restoration succeeded.
+ * 4. Leftover records from force-killed sessions or failed restorations are only resolved by
+ *    explicit user action ("恢复原音量" vs "保留当前设置") and block new sessions until handled.
  */
 object PhoneGlobalMediaMuteController {
 
@@ -78,7 +81,16 @@ object PhoneGlobalMediaMuteController {
         internal set
 
     @Volatile
+    internal var persistCommitOverrideForTesting: ((Boolean) -> Boolean)? = null
+
+    @Volatile
+    internal var clearCommitOverrideForTesting: ((Boolean) -> Boolean)? = null
+
+    @Volatile
     private var inProcessSessionEngaged: Boolean = false
+
+    @Volatile
+    private var inProcessModifiedAudio: Boolean = false
 
     private val _isGlobalMuteActive = MutableStateFlow(false)
     val isGlobalMuteActive: StateFlow<Boolean> = _isGlobalMuteActive.asStateFlow()
@@ -92,6 +104,12 @@ object PhoneGlobalMediaMuteController {
     private val _globalMediaMuteDisabledReason = MutableStateFlow<String?>(null)
     val globalMediaMuteDisabledReason: StateFlow<String?> = _globalMediaMuteDisabledReason.asStateFlow()
 
+    internal val isModeEngagedInProcess: Boolean
+        get() = synchronized(lock) { inProcessSessionEngaged }
+
+    internal val didModifyAudioInProcess: Boolean
+        get() = synchronized(lock) { inProcessModifiedAudio }
+
     fun initialize(context: Context, isSessionCurrentlyActive: Boolean = false) {
         synchronized(lock) {
             val prefs = prefs(context)
@@ -101,24 +119,32 @@ object PhoneGlobalMediaMuteController {
             _globalMediaMuteDisabledReason.value = if (compatible) null else (reason ?: "本机整体媒体静音会导致系统内录回采静音，已禁用该备选模式。")
 
             val hasLeftover = prefs.getBoolean(KEY_ACTIVE, false)
-            if (hasLeftover && !inProcessSessionEngaged && !isSessionCurrentlyActive) {
-                val savedVol = prefs.getInt(KEY_SAVED_VOLUME, 0)
-                val maxVol = prefs.getInt(KEY_MAX_VOLUME, audioAdapter.getMusicMaxVolume(context))
-                val wasMuted = prefs.getBoolean(KEY_WAS_MUTED, false)
-                val currentVol = runCatching { audioAdapter.getMusicVolume(context) }.getOrDefault(0)
-                _pendingRecovery.value = PendingGlobalMuteRecovery(
-                    savedVolume = savedVol,
-                    maxVolume = maxVol,
-                    wasMuted = wasMuted,
-                    currentVolume = currentVol
-                )
+            if (hasLeftover && !inProcessSessionEngaged && !inProcessModifiedAudio && !isSessionCurrentlyActive) {
+                populatePendingRecoveryFromPrefsLocked(context)
             }
         }
     }
 
+    fun hasUnhandledRecoveryRecord(context: Context): Boolean {
+        synchronized(lock) {
+            if (_pendingRecovery.value != null) return true
+            val hasLeftover = prefs(context).getBoolean(KEY_ACTIVE, false)
+            if (hasLeftover && !inProcessModifiedAudio) {
+                populatePendingRecoveryFromPrefsLocked(context)
+                return true
+            }
+            return false
+        }
+    }
+
     /**
-     * Persists the current media volume & mute state synchronously, then sets `STREAM_MUSIC` volume to 0.
-     * Rolls back immediately if setting volume to 0 fails.
+     * Engages global media mute mode:
+     * - Refuses to start if an unhandled leftover/failed recovery record exists.
+     * - If the phone is already muted (`wasMuted || currentVolume == 0`), marks mode engaged
+     *   without modifying volume or writing a recovery snapshot.
+     * - Otherwise persists the original volume & mute state synchronously first, marks
+     *   [inProcessModifiedAudio] ownership immediately, and sets `STREAM_MUSIC` volume to 0.
+     *   Any failure after persistence enters [restorePhoneAudioIfNeeded].
      */
     fun engageGlobalMediaMute(context: Context): Result<Unit> {
         synchronized(lock) {
@@ -128,88 +154,162 @@ object PhoneGlobalMediaMuteController {
                 return Result.failure(IllegalStateException(reason))
             }
 
+            if (hasUnhandledRecoveryRecord(context)) {
+                return Result.failure(
+                    IllegalStateException("存在未处理的媒体音量恢复记录，请先在恢复弹窗中选择“恢复原音量”或“保留当前设置”后再启动新投放。")
+                )
+            }
+
             return try {
                 val currentVolume = audioAdapter.getMusicVolume(context)
                 val maxVolume = audioAdapter.getMusicMaxVolume(context)
                 val wasMuted = audioAdapter.isMusicMuted(context)
 
-                // If there was an unacknowledged leftover recovery, clear its prompt since user explicitly started a new global mute
-                _pendingRecovery.value = null
+                // If phone is already muted prior to casting, mark mode ready without modifying volume or persisting a snapshot
+                if (wasMuted || currentVolume == 0) {
+                    inProcessSessionEngaged = true
+                    inProcessModifiedAudio = false
+                    _isGlobalMuteActive.value = true
+                    return Result.success(Unit)
+                }
 
                 // Step 1: Synchronously persist original volume & mute state BEFORE modifying system volume
-                val committed = prefs(context).edit()
-                    .putBoolean(KEY_ACTIVE, true)
-                    .putInt(KEY_SAVED_VOLUME, currentVolume)
-                    .putInt(KEY_MAX_VOLUME, maxVolume)
-                    .putBoolean(KEY_WAS_MUTED, wasMuted)
-                    .commit()
+                val overrideCommit = persistCommitOverrideForTesting?.invoke(true)
+                val committed = if (overrideCommit == false) {
+                    false
+                } else {
+                    val rawCommitted = prefs(context).edit()
+                        .putBoolean(KEY_ACTIVE, true)
+                        .putInt(KEY_SAVED_VOLUME, currentVolume)
+                        .putInt(KEY_MAX_VOLUME, maxVolume)
+                        .putBoolean(KEY_WAS_MUTED, wasMuted)
+                        .commit()
+                    overrideCommit ?: rawCommitted
+                }
                 if (!committed) {
                     return Result.failure(IllegalStateException("无法持久化原媒体音量状态，拒绝执行整体静音。"))
                 }
 
-                // Step 2: Set STREAM_MUSIC volume to 0
-                audioAdapter.setMusicVolume(context, 0)
-                val afterVolume = audioAdapter.getMusicVolume(context)
-                if (afterVolume != 0) {
-                    // Rollback immediately on failure
-                    clearPersistedRecordLocked(context)
-                    runCatching { audioAdapter.setMusicVolume(context, currentVolume) }
-                    return Result.failure(
-                        IllegalStateException("无法将系统媒体音量设为 0 (当前音量=$afterVolume)，已回滚恢复。")
+                // Step 2: Record in-process modification ownership immediately after persistence succeeds
+                inProcessSessionEngaged = true
+                inProcessModifiedAudio = true
+                _isGlobalMuteActive.value = true
+
+                // Step 3: Set STREAM_MUSIC volume to 0; any failure from here enters unified recovery
+                try {
+                    audioAdapter.setMusicVolume(context, 0)
+                    val afterVolume = audioAdapter.getMusicVolume(context)
+                    if (afterVolume != 0) {
+                        throw IllegalStateException("无法将系统媒体音量设为 0 (当前音量=$afterVolume)")
+                    }
+                    Result.success(Unit)
+                } catch (muteErr: Throwable) {
+                    val rollbackResult = restorePhoneAudioIfNeeded(context)
+                    val rollbackSuffix = rollbackResult.fold(
+                        onSuccess = { "，已自动恢复原媒体音量。" },
+                        onFailure = { err -> "，且自动回滚原音量失败（${err.message}），请手动处理恢复记录。" }
+                    )
+                    Result.failure(
+                        IllegalStateException("执行整体媒体静音失败：${muteErr.message}$rollbackSuffix", muteErr)
                     )
                 }
-
-                inProcessSessionEngaged = true
-                _isGlobalMuteActive.value = true
-                Result.success(Unit)
             } catch (e: Throwable) {
-                clearPersistedRecordLocked(context)
-                inProcessSessionEngaged = false
-                _isGlobalMuteActive.value = false
+                if (inProcessModifiedAudio) {
+                    restorePhoneAudioIfNeeded(context)
+                } else {
+                    inProcessSessionEngaged = false
+                    _isGlobalMuteActive.value = false
+                }
                 Result.failure(IllegalStateException("执行整体媒体静音失败：${e.message}", e))
             }
         }
     }
 
     /**
-     * Immediately restores the phone's `STREAM_MUSIC` volume if this session engaged global media mute.
-     * If the user manually changed the media volume to non-zero (`> 0`) during casting, preserves
-     * the user's new volume setting instead of overwriting it.
+     * Restores the phone's `STREAM_MUSIC` volume if this session modified media audio:
+     * - Never auto-restores force-kill leftover records not owned by this process.
+     * - If the phone was already muted before session start ([inProcessSessionEngaged] && ![inProcessModifiedAudio]),
+     *   leaves system audio state untouched.
+     * - If the user manually raised media volume to non-zero (`> 0`) during casting, preserves user's setting.
+     * - Only clears the persisted record after confirming restoration succeeded; retains snapshot and
+     *   surfaces [pendingRecovery] if restoration or record clearing fails.
      */
-    fun restorePhoneAudioIfNeeded(context: Context): String? {
+    fun restorePhoneAudioIfNeeded(context: Context): Result<String?> {
         synchronized(lock) {
-            val prefs = prefs(context)
-            val wasActiveInPrefs = prefs.getBoolean(KEY_ACTIVE, false)
-            if (!inProcessSessionEngaged && (!wasActiveInPrefs || _pendingRecovery.value != null)) {
+            if (!inProcessSessionEngaged && !inProcessModifiedAudio) {
                 _isGlobalMuteActive.value = false
-                return null
+                return Result.success(null)
             }
 
+            if (inProcessSessionEngaged && !inProcessModifiedAudio) {
+                inProcessSessionEngaged = false
+                _isGlobalMuteActive.value = false
+                return Result.success("Global media mute ended: phone was already muted before session; kept original system state.")
+            }
+
+            val prefs = prefs(context)
             val savedVolume = prefs.getInt(KEY_SAVED_VOLUME, 0)
+            val maxVolume = prefs.getInt(KEY_MAX_VOLUME, runCatching { audioAdapter.getMusicMaxVolume(context) }.getOrDefault(15))
             val wasMuted = prefs.getBoolean(KEY_WAS_MUTED, false)
-            inProcessSessionEngaged = false
-            _isGlobalMuteActive.value = false
-            clearPersistedRecordLocked(context)
 
             return try {
                 val currentVolume = audioAdapter.getMusicVolume(context)
-                if (currentVolume > 0) {
+                val currentlyMuted = audioAdapter.isMusicMuted(context)
+                val statusMessage = if (currentVolume > 0 && !currentlyMuted) {
                     "Global media mute ended: preserved user's non-zero media volume ($currentVolume)."
                 } else {
                     if (!wasMuted && savedVolume > 0) {
-                        runCatching { audioAdapter.setMusicMuted(context, false) }
+                        audioAdapter.setMusicMuted(context, false)
                         audioAdapter.setMusicVolume(context, savedVolume)
+                        val verifiedVol = audioAdapter.getMusicVolume(context)
+                        val verifiedMuted = audioAdapter.isMusicMuted(context)
+                        if (verifiedVol != savedVolume || verifiedMuted) {
+                            throw IllegalStateException("系统媒体音量未能恢复至 $savedVolume (当前音量=$verifiedVol, 静音=$verifiedMuted)")
+                        }
                         "Global media mute ended: restored media volume to $savedVolume."
                     } else if (wasMuted) {
                         audioAdapter.setMusicVolume(context, savedVolume)
-                        runCatching { audioAdapter.setMusicMuted(context, true) }
+                        audioAdapter.setMusicMuted(context, true)
                         "Global media mute ended: restored previous muted state (volume=$savedVolume)."
                     } else {
                         "Global media mute ended: original media volume was already 0."
                     }
                 }
+
+                val cleared = clearPersistedRecordLocked(context)
+                if (!cleared) {
+                    inProcessSessionEngaged = false
+                    inProcessModifiedAudio = false
+                    _isGlobalMuteActive.value = false
+                    populatePendingRecoveryLocked(
+                        context = context,
+                        savedVolume = savedVolume,
+                        maxVolume = maxVolume,
+                        wasMuted = wasMuted
+                    )
+                    return Result.failure(
+                        IllegalStateException("媒体音量恢复已执行，但清除持久化恢复记录失败，请确认恢复状态。")
+                    )
+                }
+
+                inProcessSessionEngaged = false
+                inProcessModifiedAudio = false
+                _isGlobalMuteActive.value = false
+                _pendingRecovery.value = null
+                Result.success(statusMessage)
             } catch (e: Throwable) {
-                "Global media mute restore encountered error: ${e.message}"
+                inProcessSessionEngaged = false
+                inProcessModifiedAudio = false
+                _isGlobalMuteActive.value = false
+                populatePendingRecoveryLocked(
+                    context = context,
+                    savedVolume = savedVolume,
+                    maxVolume = maxVolume,
+                    wasMuted = wasMuted
+                )
+                Result.failure(
+                    IllegalStateException("恢复手机原媒体音量失败：${e.message}", e)
+                )
             }
         }
     }
@@ -218,45 +318,84 @@ object PhoneGlobalMediaMuteController {
         synchronized(lock) {
             if (!inProcessSessionEngaged) return false
             val currentVol = runCatching { audioAdapter.getMusicVolume(context) }.getOrDefault(0)
-            val muted = currentVol == 0
+            val muted = currentVol == 0 || runCatching { audioAdapter.isMusicMuted(context) }.getOrDefault(false)
             _isGlobalMuteActive.value = muted
             return muted
         }
     }
 
     /**
-     * Invoked when the user clicks "恢复原音量" on the startup crash-recovery dialog.
+     * Invoked when the user clicks "恢复原音量" on the recovery dialog.
+     * Returns [Result.failure] and keeps [pendingRecovery] if restoration or record clearing fails.
      */
-    fun confirmRestoreLeftoverVolume(context: Context) {
+    fun confirmRestoreLeftoverVolume(context: Context): Result<Unit> {
         synchronized(lock) {
-            val pending = _pendingRecovery.value ?: return
-            _pendingRecovery.value = null
-            inProcessSessionEngaged = false
-            _isGlobalMuteActive.value = false
-            clearPersistedRecordLocked(context)
-            runCatching {
+            val pending = _pendingRecovery.value ?: run {
+                if (prefs(context).getBoolean(KEY_ACTIVE, false)) {
+                    populatePendingRecoveryFromPrefsLocked(context)
+                }
+                _pendingRecovery.value
+            } ?: return Result.success(Unit)
+
+            return try {
                 if (!pending.wasMuted && pending.savedVolume > 0) {
                     audioAdapter.setMusicMuted(context, false)
                     audioAdapter.setMusicVolume(context, pending.savedVolume)
+                    val verifiedVol = audioAdapter.getMusicVolume(context)
+                    val verifiedMuted = audioAdapter.isMusicMuted(context)
+                    if (verifiedVol != pending.savedVolume || verifiedMuted) {
+                        throw IllegalStateException("系统媒体音量未能恢复至 ${pending.savedVolume} (当前=$verifiedVol)")
+                    }
                 } else {
                     audioAdapter.setMusicVolume(context, pending.savedVolume)
                     if (pending.wasMuted) {
                         audioAdapter.setMusicMuted(context, true)
                     }
                 }
+
+                val cleared = clearPersistedRecordLocked(context)
+                if (!cleared) {
+                    populatePendingRecoveryLocked(
+                        context = context,
+                        savedVolume = pending.savedVolume,
+                        maxVolume = pending.maxVolume,
+                        wasMuted = pending.wasMuted
+                    )
+                    return Result.failure(IllegalStateException("已写回原媒体音量，但清除持久化恢复记录失败。"))
+                }
+
+                _pendingRecovery.value = null
+                inProcessSessionEngaged = false
+                inProcessModifiedAudio = false
+                _isGlobalMuteActive.value = false
+                Result.success(Unit)
+            } catch (e: Throwable) {
+                populatePendingRecoveryLocked(
+                    context = context,
+                    savedVolume = pending.savedVolume,
+                    maxVolume = pending.maxVolume,
+                    wasMuted = pending.wasMuted
+                )
+                Result.failure(IllegalStateException("恢复原媒体音量失败：${e.message}", e))
             }
         }
     }
 
     /**
-     * Invoked when the user clicks "保留当前音量" on the startup crash-recovery dialog.
+     * Invoked when the user clicks "保留当前音量" on the recovery dialog.
+     * Returns [Result.failure] and retains [pendingRecovery] if clearing the persisted record fails.
      */
-    fun dismissLeftoverRecoveryKeepCurrent(context: Context) {
+    fun dismissLeftoverRecoveryKeepCurrent(context: Context): Result<Unit> {
         synchronized(lock) {
+            val cleared = clearPersistedRecordLocked(context)
+            if (!cleared) {
+                return Result.failure(IllegalStateException("清除未处理媒体静音恢复记录失败，请重试。"))
+            }
             _pendingRecovery.value = null
             inProcessSessionEngaged = false
+            inProcessModifiedAudio = false
             _isGlobalMuteActive.value = false
-            clearPersistedRecordLocked(context)
+            return Result.success(Unit)
         }
     }
 
@@ -293,6 +432,7 @@ object PhoneGlobalMediaMuteController {
     ) {
         synchronized(lock) {
             inProcessSessionEngaged = false
+            inProcessModifiedAudio = false
             _isGlobalMuteActive.value = false
             prefs(context).edit()
                 .putBoolean(KEY_ACTIVE, true)
@@ -306,6 +446,9 @@ object PhoneGlobalMediaMuteController {
     internal fun resetForTesting(context: Context) {
         synchronized(lock) {
             inProcessSessionEngaged = false
+            inProcessModifiedAudio = false
+            persistCommitOverrideForTesting = null
+            clearCommitOverrideForTesting = null
             _isGlobalMuteActive.value = false
             _pendingRecovery.value = null
             _isGlobalMediaMuteCompatible.value = true
@@ -315,13 +458,44 @@ object PhoneGlobalMediaMuteController {
         }
     }
 
-    private fun clearPersistedRecordLocked(context: Context) {
-        prefs(context).edit()
+    private fun populatePendingRecoveryFromPrefsLocked(context: Context) {
+        val prefs = prefs(context)
+        val savedVol = prefs.getInt(KEY_SAVED_VOLUME, 0)
+        val maxVol = prefs.getInt(
+            KEY_MAX_VOLUME,
+            runCatching { audioAdapter.getMusicMaxVolume(context) }.getOrDefault(15)
+        )
+        val wasMuted = prefs.getBoolean(KEY_WAS_MUTED, false)
+        populatePendingRecoveryLocked(context, savedVol, maxVol, wasMuted)
+    }
+
+    private fun populatePendingRecoveryLocked(
+        context: Context,
+        savedVolume: Int,
+        maxVolume: Int,
+        wasMuted: Boolean
+    ) {
+        val currentVol = runCatching { audioAdapter.getMusicVolume(context) }.getOrDefault(0)
+        _pendingRecovery.value = PendingGlobalMuteRecovery(
+            savedVolume = savedVolume,
+            maxVolume = maxVolume,
+            wasMuted = wasMuted,
+            currentVolume = currentVol
+        )
+    }
+
+    private fun clearPersistedRecordLocked(context: Context): Boolean {
+        val overrideClear = clearCommitOverrideForTesting?.invoke(true)
+        if (overrideClear == false) {
+            return false
+        }
+        val rawCommitted = prefs(context).edit()
             .remove(KEY_ACTIVE)
             .remove(KEY_SAVED_VOLUME)
             .remove(KEY_MAX_VOLUME)
             .remove(KEY_WAS_MUTED)
             .commit()
+        return overrideClear ?: rawCommitted
     }
 
     private fun prefs(context: Context) =

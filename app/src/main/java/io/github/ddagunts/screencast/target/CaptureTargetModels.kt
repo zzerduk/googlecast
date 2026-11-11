@@ -1,5 +1,21 @@
 package io.github.ddagunts.screencast.target
 
+import android.content.pm.ApplicationInfo
+import android.os.Build
+
+fun isAudioOrVideoAppCategory(category: Int): Boolean {
+    return category == ApplicationInfo.CATEGORY_AUDIO ||
+        category == ApplicationInfo.CATEGORY_VIDEO
+}
+
+fun readApplicationCategory(appInfo: ApplicationInfo): Int {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        appInfo.category
+    } else {
+        ApplicationInfo.CATEGORY_UNDEFINED
+    }
+}
+
 enum class ProfileType(val badgeLabel: String) {
     PRIMARY("主空间"),
     WORK("工作资料"),
@@ -105,17 +121,19 @@ data class TargetAppEntry(
     val isSystemApp: Boolean = false,
     val resolvedUid: Int? = null,
     val sharedUidPackages: List<String> = emptyList(),
-    val isCaptureRestrictedByManifest: Boolean = false,
     val isIdentityVerified: Boolean = true,
     val isSharedUidVerified: Boolean = true,
-    val statusReason: String? = null
+    val statusReason: String? = null,
+    val appCategory: Int = ApplicationInfo.CATEGORY_UNDEFINED
 ) {
     val isSelectable: Boolean
         get() = isInstalled &&
             isProfileRunning &&
-            !isCaptureRestrictedByManifest &&
             isIdentityVerified &&
             isSharedUidVerified
+
+    val isAudioOrVideoCategory: Boolean
+        get() = isAudioOrVideoAppCategory(appCategory)
 }
 
 data class TargetResolutionResult(
@@ -132,6 +150,7 @@ data class SessionMuteTelemetry(
     val resolvedTargetUids: Set<Int> = emptySet(),
     val activeTargetPlayerCount: Int = 0,
     val confirmedMutedPlayerCount: Int = 0,
+    val pendingRestoreCount: Int = 0,
     val lastMixerMutedByMask: Int = 0,
     val lastMuteConfirmationLatencyMs: Long? = null,
     val maxObservedNewTrackMuteLatencyMs: Long? = null,

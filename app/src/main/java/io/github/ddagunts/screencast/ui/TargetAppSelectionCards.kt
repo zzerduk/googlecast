@@ -63,9 +63,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -91,6 +93,9 @@ import io.github.ddagunts.screencast.target.SessionMuteTelemetry
 import io.github.ddagunts.screencast.target.TargetAppEntry
 import io.github.ddagunts.screencast.target.TargetPreset
 import io.github.ddagunts.screencast.target.UserProfileInfo
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -685,6 +690,40 @@ fun ProfileBadge(
     }
 }
 
+internal object AppIconLoader {
+    private val memoryCache = ConcurrentHashMap<String, ImageBitmap>()
+
+    @Volatile
+    var onLoadIconHookForTesting: ((packageName: String, userSerialNumber: Long, threadName: String) -> Unit)? = null
+
+    @Volatile
+    var customIconProviderForTesting: ((Context, String, Long) -> ImageBitmap?)? = null
+
+    fun clearCacheForTesting() {
+        memoryCache.clear()
+        onLoadIconHookForTesting = null
+        customIconProviderForTesting = null
+    }
+
+    suspend fun loadIconAsync(
+        context: Context,
+        packageName: String,
+        userSerialNumber: Long
+    ): ImageBitmap? {
+        val key = "$userSerialNumber:$packageName"
+        memoryCache[key]?.let { return it }
+        return withContext(Dispatchers.IO) {
+            onLoadIconHookForTesting?.invoke(packageName, userSerialNumber, Thread.currentThread().name)
+            val loaded = customIconProviderForTesting?.invoke(context, packageName, userSerialNumber)
+                ?: loadAppIconBitmap(context, packageName, userSerialNumber)
+            if (loaded != null) {
+                memoryCache[key] = loaded
+            }
+            loaded
+        }
+    }
+}
+
 @Composable
 fun AppIconThumbnail(
     packageName: String,
@@ -693,13 +732,18 @@ fun AppIconThumbnail(
     size: Dp = 40.dp
 ) {
     val context = LocalContext.current
-    val iconBitmap = remember(packageName, userSerialNumber) {
-        loadAppIconBitmap(context, packageName, userSerialNumber)
+    val appContext = remember(context) { context.applicationContext }
+    val iconBitmap by produceState<ImageBitmap?>(
+        initialValue = null,
+        key1 = packageName,
+        key2 = userSerialNumber
+    ) {
+        value = AppIconLoader.loadIconAsync(appContext, packageName, userSerialNumber)
     }
 
     if (iconBitmap != null) {
         Image(
-            bitmap = iconBitmap,
+            bitmap = iconBitmap!!,
             contentDescription = appLabel,
             modifier = Modifier
                 .size(size)
@@ -740,11 +784,15 @@ private fun loadAppIconBitmap(
             val activityIcon = runCatching {
                 launcherApps.getActivityList(packageName, handle).firstOrNull()?.getBadgedIcon(0)
             }.getOrNull()
-            activityIcon ?: runCatching {
-                val appInfo = launcherApps.getApplicationInfo(packageName, 0, handle)
-                val baseIcon = context.packageManager.getApplicationIcon(appInfo)
-                context.packageManager.getUserBadgedIcon(baseIcon, handle)
-            }.getOrNull()
+            activityIcon ?: if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                runCatching {
+                    val appInfo = launcherApps.getApplicationInfo(packageName, 0, handle)
+                    val baseIcon = context.packageManager.getApplicationIcon(appInfo)
+                    context.packageManager.getUserBadgedIcon(baseIcon, handle)
+                }.getOrNull()
+            } else {
+                null
+            }
         } else {
             null
         } ?: runCatching {
@@ -783,7 +831,8 @@ fun VisualAppPickerBottomSheet(
     selectedTargets: Set<CaptureTarget>,
     onDismiss: () -> Unit,
     onAddTargetApp: (packageName: String, userSerialNumber: Long) -> Unit,
-    onRemoveTargetApp: (CaptureTarget) -> Unit
+    onRemoveTargetApp: (CaptureTarget) -> Unit,
+    onSearchQueryChanged: (String) -> Unit = {}
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     // -1L represents "All Profiles" (全部空间)
@@ -796,25 +845,37 @@ fun VisualAppPickerBottomSheet(
     var manualSerial by rememberSaveable { mutableLongStateOf(defaultManualSerial) }
     var manualPackageName by rememberSaveable { mutableStateOf("") }
 
+    DisposableEffect(Unit) {
+        onDispose {
+            onSearchQueryChanged("")
+        }
+    }
+
     val filteredApps = remember(
         searchableApps,
         selectedProfileFilter,
         searchQuery,
         showSystemApps,
-        importedTargets
+        importedTargets,
+        selectedTargets
     ) {
         val q = searchQuery.trim().lowercase()
         searchableApps.filter { entry ->
+            val inPool = entry.target in importedTargets || entry.target in selectedTargets
             val matchesProfile = selectedProfileFilter == -1L ||
                 entry.target.userSerialNumber == selectedProfileFilter
+            // "显示系统应用" only controls system app visibility; it never bypasses audio/video category filtering when search is empty
+            val matchesCategoryWhenSearchEmpty = q.isNotEmpty() ||
+                entry.isAudioOrVideoCategory ||
+                inPool
             val matchesSystem = showSystemApps ||
                 !entry.isSystemApp ||
-                entry.target in importedTargets ||
+                inPool ||
                 q.isNotEmpty()
             val matchesQuery = q.isEmpty() ||
                 entry.appLabel.lowercase().contains(q) ||
                 entry.target.packageName.lowercase().contains(q)
-            matchesProfile && matchesSystem && matchesQuery
+            matchesProfile && matchesCategoryWhenSearchEmpty && matchesSystem && matchesQuery
         }
     }
 
@@ -844,7 +905,7 @@ fun VisualAppPickerBottomSheet(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "点击应用即可加入主界面目标列表并自动勾选 • 已添加 ${importedTargets.size} 个",
+                        text = "默认展示音视频与已导入目标；搜索或手动输入包名可添加任意应用 • 已添加 ${importedTargets.size} 个",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -871,14 +932,23 @@ fun VisualAppPickerBottomSheet(
             // Instant Search Field
             OutlinedTextField(
                 value = searchQuery,
-                onValueChange = { searchQuery = it },
+                onValueChange = { newQuery ->
+                    searchQuery = newQuery
+                    onSearchQueryChanged(newQuery)
+                },
                 placeholder = { Text("搜索应用名称或包名...") },
                 leadingIcon = {
                     Icon(imageVector = Icons.Filled.Search, contentDescription = "搜索")
                 },
                 trailingIcon = {
                     if (searchQuery.isNotEmpty()) {
-                        IconButton(onClick = { searchQuery = "" }) {
+                        IconButton(
+                            onClick = {
+                                searchQuery = ""
+                                onSearchQueryChanged("")
+                            },
+                            modifier = Modifier.testTag("clear_search_query_button")
+                        ) {
                             Icon(imageVector = Icons.Filled.Clear, contentDescription = "清空搜索")
                         }
                     }
@@ -1147,6 +1217,7 @@ fun CollapsibleDiagnosticsCard(
 ) {
     val hasAlert = telemetry.error != null ||
         muteTelemetry.muteFailureReason != null ||
+        muteTelemetry.pendingRestoreCount > 0 ||
         muteTelemetry.isNewTrackLatencyWithinGate == false
     var expanded by rememberSaveable { mutableStateOf(false) }
     val isExpanded = expanded || hasAlert
@@ -1233,6 +1304,7 @@ fun CollapsibleDiagnosticsCard(
 @Composable
 private fun GateStatusPill(muteTelemetry: SessionMuteTelemetry) {
     val gateBadgeText = when {
+        muteTelemetry.pendingRestoreCount > 0 -> "RESTORE PENDING (${muteTelemetry.pendingRestoreCount})"
         muteTelemetry.muteFailureReason != null -> "GATE BLOCKED"
         muteTelemetry.isNewTrackLatencyWithinGate == false -> ">100ms FAIL"
         muteTelemetry.leaseActive && muteTelemetry.confirmedMutedPlayerCount > 0 ->
@@ -1243,7 +1315,8 @@ private fun GateStatusPill(muteTelemetry: SessionMuteTelemetry) {
     Surface(
         shape = RoundedCornerShape(50),
         color = when {
-            muteTelemetry.muteFailureReason != null ||
+            muteTelemetry.pendingRestoreCount > 0 ||
+                muteTelemetry.muteFailureReason != null ||
                 muteTelemetry.isNewTrackLatencyWithinGate == false ->
                 MaterialTheme.colorScheme.errorContainer
             muteTelemetry.leaseActive ->

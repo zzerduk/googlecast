@@ -126,6 +126,13 @@ fun ScreenCastAudioScreen(
     onSearchQueryChanged: (String) -> Unit = {}
 ) {
     var showAppPickerSheet by rememberSaveable { mutableStateOf(false) }
+    val effectiveOutputMode = if (telemetry.isSessionActive || isRequestingCapture) {
+        telemetry.activeOutputMode
+    } else if (muteTelemetry.shizukuState == ShizukuConnectionState.READY) {
+        PhoneOutputMode.SHIZUKU_SESSION_MUTE
+    } else {
+        telemetry.activeOutputMode
+    }
 
     Scaffold(
         contentWindowInsets = WindowInsets.safeDrawing,
@@ -178,6 +185,7 @@ fun ScreenCastAudioScreen(
                         selectedTargets = selectedTargets,
                         importedTargets = importedTargets,
                         presets = presets,
+                        activeOutputMode = effectiveOutputMode,
                         isEditingLocked = isTargetEditingLocked,
                         onToggleTarget = onToggleTarget,
                         onClearTargets = onClearTargets,

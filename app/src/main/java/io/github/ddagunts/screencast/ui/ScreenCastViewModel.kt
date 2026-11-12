@@ -27,6 +27,7 @@ import io.github.ddagunts.screencast.target.TargetAppEntry
 import io.github.ddagunts.screencast.target.TargetPreset
 import io.github.ddagunts.screencast.target.UserProfileInfo
 import io.github.ddagunts.screencast.webrtc.WebRtcStage
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -34,6 +35,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 
 class ScreenCastViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -60,12 +62,16 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
     private val _showOutputModeDialog = MutableStateFlow(false)
     val showOutputModeDialog: StateFlow<Boolean> = _showOutputModeDialog.asStateFlow()
 
+    private val captureRequestGuard = AtomicBoolean(false)
     private val _isRequestingCapture = MutableStateFlow(false)
     val isRequestingCapture: StateFlow<Boolean> = _isRequestingCapture.asStateFlow()
     private var requestedChannel: CastSignalingChannel? = null
 
     private val _isTargetEditingLocked = MutableStateFlow(false)
     val isTargetEditingLocked: StateFlow<Boolean> = _isTargetEditingLocked.asStateFlow()
+
+    @Volatile
+    internal var preflightSuspendHookForTesting: (suspend () -> Unit)? = null
 
     init {
         CaptureTargetRepository.initialize(application)
@@ -94,9 +100,33 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    override fun onCleared() {
+        if (captureRequestGuard.get() || _isRequestingCapture.value) {
+            releaseCaptureRequestSlot()
+        }
+        super.onCleared()
+    }
+
+    private fun acquireCaptureRequestSlot(): Boolean {
+        if (isCaptureLockedInProcess() || telemetry.value.isSessionActive) return false
+        if (!captureRequestGuard.compareAndSet(false, true)) return false
+        _isRequestingCapture.value = true
+        computeEditingLockedNow()
+        return true
+    }
+
+    private fun releaseCaptureRequestSlot() {
+        requestedChannel = null
+        captureRequestGuard.set(false)
+        _isRequestingCapture.value = false
+        CaptureTargetRepository.clearFrozenTargetsSnapshot()
+        computeEditingLockedNow()
+    }
+
     private fun computeEditingLockedNow(): Boolean {
         val current = telemetry.value
         val locked = _isRequestingCapture.value ||
+            captureRequestGuard.get() ||
             current.isSessionActive ||
             current.isCaptureLocked ||
             AudioCastSessionCoordinator.isCaptureLocked ||
@@ -284,6 +314,7 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
 
     /**
      * Entry point when user clicks "Start Audio Cast":
+     * - Acquires the capture request lock BEFORE the first suspension point to prevent double-tap re-entry.
      * - Refuses to start if an unhandled global media mute recovery record exists.
      * - If Shizuku is `READY`, defaults to [PhoneOutputMode.SHIZUKU_SESSION_MUTE] and proceeds immediately.
      * - If Shizuku is unavailable or permission is not granted, opens the fallback output mode dialog
@@ -291,46 +322,57 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
      *   [PhoneOutputMode.CAPTURE_ONLY_UNMUTED].
      */
     suspend fun initiateStartCastFlow(requireConnectedCastReceiver: Boolean = true): Boolean {
-        if (isCaptureLockedInProcess()) return false
-        if (_isRequestingCapture.value || telemetry.value.isSessionActive) return false
+        if (!acquireCaptureRequestSlot()) return false
+        var keepRequestLock = false
+        try {
+            preflightSuspendHookForTesting?.invoke()
+            val hasUnhandledRecovery = withContext(Dispatchers.IO) {
+                PhoneGlobalMediaMuteController.hasUnhandledRecoveryRecord(getApplication())
+            }
+            if (hasUnhandledRecovery) {
+                failPreflightPreparation(
+                    "存在未处理的媒体音量恢复记录，请先在恢复弹窗中选择“恢复原音量”或“保留当前设置”后再启动新投放。"
+                )
+                return false
+            }
 
-        val hasUnhandledRecovery = withContext(Dispatchers.IO) {
-            PhoneGlobalMediaMuteController.hasUnhandledRecoveryRecord(getApplication())
-        }
-        if (hasUnhandledRecovery) {
-            captureAuthorizationFailed(
-                "存在未处理的媒体音量恢复记录，请先在恢复弹窗中选择“恢复原音量”或“保留当前设置”后再启动新投放。"
-            )
-            return false
-        }
+            val currentTargets = selectedTargets.value
+            if (currentTargets.isEmpty()) {
+                failPreflightPreparation("请先添加并至少勾选 1 个目标应用（空目标禁止启动）。")
+                return false
+            }
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                failPreflightPreparation("WebRTC playback capture requires Android 10 or later.")
+                return false
+            }
+            if (requireConnectedCastReceiver && !castStatus.value.isConnected) {
+                failPreflightPreparation(castStatus.value.error ?: "请先通过右上角 Cast 按钮连接音箱接收端。")
+                return false
+            }
 
-        val currentTargets = selectedTargets.value
-        if (currentTargets.isEmpty()) {
-            captureAuthorizationFailed("请先添加并至少勾选 1 个目标应用（空目标禁止启动）。")
-            return false
-        }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            captureAuthorizationFailed("WebRTC playback capture requires Android 10 or later.")
-            return false
-        }
-        if (requireConnectedCastReceiver && !castStatus.value.isConnected) {
-            captureAuthorizationFailed(castStatus.value.error ?: "请先通过右上角 Cast 按钮连接音箱接收端。")
-            return false
-        }
-
-        withContext(Dispatchers.IO) {
-            ShizukuSessionMuteController.syncShizukuConnectionState()
-        }
-        val shizukuState = muteTelemetry.value.shizukuState
-        return if (shizukuState == ShizukuConnectionState.READY) {
-            _showOutputModeDialog.value = false
-            prepareCaptureRequest(
-                requireConnectedCastReceiver = requireConnectedCastReceiver,
-                outputMode = PhoneOutputMode.SHIZUKU_SESSION_MUTE
-            )
-        } else {
-            _showOutputModeDialog.value = true
-            false
+            withContext(Dispatchers.IO) {
+                ShizukuSessionMuteController.syncShizukuConnectionState()
+            }
+            val shizukuState = muteTelemetry.value.shizukuState
+            return if (shizukuState == ShizukuConnectionState.READY) {
+                _showOutputModeDialog.value = false
+                keepRequestLock = prepareCaptureRequestLocked(
+                    requireConnectedCastReceiver = requireConnectedCastReceiver,
+                    outputMode = PhoneOutputMode.SHIZUKU_SESSION_MUTE,
+                    skipInitialRecoveryCheck = true
+                )
+                keepRequestLock
+            } else {
+                _showOutputModeDialog.value = true
+                false
+            }
+        } catch (e: CancellationException) {
+            releaseCaptureRequestSlot()
+            throw e
+        } finally {
+            if (!keepRequestLock) {
+                releaseCaptureRequestSlot()
+            }
         }
     }
 
@@ -339,6 +381,9 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         requireConnectedCastReceiver: Boolean = true
     ): Boolean {
         _showOutputModeDialog.value = false
+        AudioCastSessionCoordinator.updateTelemetry {
+            it.copy(activeOutputMode = chosenMode)
+        }
         return prepareCaptureRequest(
             requireConnectedCastReceiver = requireConnectedCastReceiver,
             outputMode = chosenMode
@@ -349,48 +394,69 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         requireConnectedCastReceiver: Boolean = true,
         outputMode: PhoneOutputMode = PhoneOutputMode.SHIZUKU_SESSION_MUTE
     ): Boolean {
-        if (isCaptureLockedInProcess()) {
+        if (!acquireCaptureRequestSlot()) {
             return false
         }
-        if (_isRequestingCapture.value || telemetry.value.isSessionActive) {
-            return false
-        }
-
-        val hasUnhandledRecovery = withContext(Dispatchers.IO) {
-            PhoneGlobalMediaMuteController.hasUnhandledRecoveryRecord(getApplication())
-        }
-        if (hasUnhandledRecovery) {
-            captureAuthorizationFailed(
-                "存在未处理的媒体音量恢复记录，请先在恢复弹窗中选择“恢复原音量”或“保留当前设置”后再启动新投放。"
+        var keepRequestLock = false
+        try {
+            keepRequestLock = prepareCaptureRequestLocked(
+                requireConnectedCastReceiver = requireConnectedCastReceiver,
+                outputMode = outputMode,
+                skipInitialRecoveryCheck = false
             )
-            return false
+            return keepRequestLock
+        } catch (e: CancellationException) {
+            releaseCaptureRequestSlot()
+            throw e
+        } finally {
+            if (!keepRequestLock) {
+                releaseCaptureRequestSlot()
+            }
+        }
+    }
+
+    private suspend fun prepareCaptureRequestLocked(
+        requireConnectedCastReceiver: Boolean,
+        outputMode: PhoneOutputMode,
+        skipInitialRecoveryCheck: Boolean
+    ): Boolean {
+        if (!skipInitialRecoveryCheck) {
+            preflightSuspendHookForTesting?.invoke()
+            val hasUnhandledRecovery = withContext(Dispatchers.IO) {
+                PhoneGlobalMediaMuteController.hasUnhandledRecoveryRecord(getApplication())
+            }
+            if (hasUnhandledRecovery) {
+                failPreflightPreparation(
+                    "存在未处理的媒体音量恢复记录，请先在恢复弹窗中选择“恢复原音量”或“保留当前设置”后再启动新投放。"
+                )
+                return false
+            }
         }
 
         val currentTargets = selectedTargets.value
         if (currentTargets.isEmpty()) {
-            captureAuthorizationFailed("请先添加并至少勾选 1 个要投音的目标应用（空目标禁止启动）。")
+            failPreflightPreparation("请先添加并至少勾选 1 个要投音的目标应用（空目标禁止启动）。")
             return false
         }
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            captureAuthorizationFailed("WebRTC playback capture requires Android 10 or later.")
+            failPreflightPreparation("WebRTC playback capture requires Android 10 or later.")
             return false
         }
         if (requireConnectedCastReceiver) {
             if (!castStatus.value.isConnected) {
-                captureAuthorizationFailed(castStatus.value.error ?: "请先通过右上角 Cast 按钮连接音箱接收端。")
+                failPreflightPreparation(castStatus.value.error ?: "请先通过右上角 Cast 按钮连接音箱接收端。")
                 return false
             }
             requestedChannel = CastSdkSessionController.channel
             if (requestedChannel == null) {
-                captureAuthorizationFailed("The Cast session ended. Reconnect before requesting capture.")
+                failPreflightPreparation("The Cast session ended. Reconnect before requesting capture.")
                 return false
             }
         }
 
         // Freeze selected CaptureTarget snapshot and lock target editing immediately before preflight IO
         CaptureTargetRepository.freezeSelectedTargetsSnapshot(outputMode)
-        _isRequestingCapture.value = true
         computeEditingLockedNow()
 
         withContext(Dispatchers.IO) {
@@ -400,7 +466,7 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         if (outputMode == PhoneOutputMode.SHIZUKU_SESSION_MUTE &&
             shizukuState != ShizukuConnectionState.READY
         ) {
-            captureAuthorizationFailed(
+            failPreflightPreparation(
                 "Shizuku Shell 服务未就绪 (${shizukuState.statusLabel})，无法执行定向静音，请授权 Shizuku 或选择备选输出模式。"
             )
             return false
@@ -410,7 +476,7 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         ) {
             val disabledReason = PhoneGlobalMediaMuteController.globalMediaMuteDisabledReason.value
                 ?: "本机整体媒体静音会导致系统回采静音，已禁用该选项，请选择“仅采集不静音”。"
-            captureAuthorizationFailed(disabledReason)
+            failPreflightPreparation(disabledReason)
             return false
         }
 
@@ -419,12 +485,14 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
                 context = getApplication(),
                 outputModeOverride = outputMode
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Throwable) {
-            captureAuthorizationFailed(e.message ?: "所选目标应用校验异常。")
+            failPreflightPreparation(e.message ?: "所选目标应用校验异常。")
             return false
         }
         if (!preflightCheck.isValid) {
-            captureAuthorizationFailed(preflightCheck.failureReason ?: "所选目标应用校验未通过。")
+            failPreflightPreparation(preflightCheck.failureReason ?: "所选目标应用校验未通过。")
             return false
         }
 
@@ -437,34 +505,29 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         return true
     }
 
+    private fun failPreflightPreparation(message: String) {
+        val channel = requestedChannel
+        releaseCaptureRequestSlot()
+        if (!isCaptureLockedInProcess()) {
+            AudioCastSessionCoordinator.updateTelemetry { it.copy(error = message) }
+        }
+        AudioCastSessionCoordinator.appendLog(message)
+        channel?.endSession()
+    }
+
     fun captureAuthorizationFailed(message: String) {
         val channel = requestedChannel
-        requestedChannel = null
-        _isRequestingCapture.value = false
-        CaptureTargetRepository.clearFrozenTargetsSnapshot()
-        computeEditingLockedNow()
-        val (completedImmediate, immediateRestoreErr) = AudioCastSessionCoordinator.tryRestorePhoneAudioImmediate(
+        releaseCaptureRequestSlot()
+        if (!isCaptureLockedInProcess()) {
+            AudioCastSessionCoordinator.updateTelemetry { it.copy(error = message) }
+        }
+        AudioCastSessionCoordinator.launchRestoreAsync(
             appContext = getApplication(),
             failureReason = message
-        )
-        if (completedImmediate) {
-            val combinedMsg = AudioCastSessionCoordinator.combineErrorMessages(message, immediateRestoreErr) ?: message
+        ) { restoreError ->
+            val combinedMsg = AudioCastSessionCoordinator.combineErrorMessages(message, restoreError) ?: message
             if (!isCaptureLockedInProcess()) {
                 AudioCastSessionCoordinator.updateTelemetry { it.copy(error = combinedMsg) }
-            }
-        } else {
-            if (!isCaptureLockedInProcess()) {
-                AudioCastSessionCoordinator.updateTelemetry { it.copy(error = message) }
-            }
-            viewModelScope.launch(Dispatchers.IO) {
-                val restoreError = AudioCastSessionCoordinator.restorePhoneAudioSerialized(
-                    appContext = getApplication(),
-                    failureReason = message
-                )
-                val combinedMsg = AudioCastSessionCoordinator.combineErrorMessages(message, restoreError) ?: message
-                if (!isCaptureLockedInProcess()) {
-                    AudioCastSessionCoordinator.updateTelemetry { it.copy(error = combinedMsg) }
-                }
             }
         }
         AudioCastSessionCoordinator.appendLog(message)
@@ -473,9 +536,7 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
 
     fun startAudioCastWithProjection(resultCode: Int, resultData: Intent?) {
         if (isCaptureLockedInProcess()) {
-            requestedChannel = null
-            _isRequestingCapture.value = false
-            CaptureTargetRepository.clearFrozenTargetsSnapshot()
+            releaseCaptureRequestSlot()
             return
         }
         if (!_isRequestingCapture.value) {
@@ -501,6 +562,7 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         }
         val channel = requestedChannel
         requestedChannel = null
+        captureRequestGuard.set(false)
         _isRequestingCapture.value = false
         val frozenMode = CaptureTargetRepository.frozenOutputMode.value
             ?: PhoneOutputMode.SHIZUKU_SESSION_MUTE
@@ -533,26 +595,29 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun stopAudioCast() {
-        requestedChannel = null
-        _isRequestingCapture.value = false
         val wasSessionActive = telemetry.value.isSessionActive
-        CaptureTargetRepository.clearFrozenTargetsSnapshot()
-        computeEditingLockedNow()
+        releaseCaptureRequestSlot()
         if (isCaptureLockedInProcess()) {
-            viewModelScope.launch(Dispatchers.IO) {
-                AudioCastSessionCoordinator.restorePhoneAudioSerialized(getApplication(), null)
-            }
+            AudioCastSessionCoordinator.launchRestoreAsync(getApplication(), null)
             CastSdkSessionController.endSession()
             return
         }
         if (!wasSessionActive) {
-            viewModelScope.launch(Dispatchers.IO) {
-                val restoreErr = AudioCastSessionCoordinator.restorePhoneAudioSerialized(getApplication(), null)
-                AudioCastSessionCoordinator.updateTelemetry {
-                    AudioPipelineTelemetry(
-                        webRtcStage = if (restoreErr != null) WebRtcStage.ERROR else WebRtcStage.IDLE,
-                        error = restoreErr
-                    )
+            AudioCastSessionCoordinator.updateTelemetry {
+                AudioPipelineTelemetry(
+                    activeOutputMode = it.activeOutputMode,
+                    webRtcStage = WebRtcStage.IDLE,
+                    error = null
+                )
+            }
+            AudioCastSessionCoordinator.launchRestoreAsync(getApplication(), null) { restoreErr ->
+                if (restoreErr != null) {
+                    AudioCastSessionCoordinator.updateTelemetry {
+                        it.copy(
+                            webRtcStage = WebRtcStage.ERROR,
+                            error = restoreErr
+                        )
+                    }
                 }
             }
             CastSdkSessionController.endSession()
@@ -565,8 +630,7 @@ class ScreenCastViewModel(application: Application) : AndroidViewModel(applicati
         try {
             app.startService(stopIntent)
         } catch (e: Exception) {
-            viewModelScope.launch(Dispatchers.IO) {
-                val restoreErr = AudioCastSessionCoordinator.restorePhoneAudioSerialized(getApplication(), e.message)
+            AudioCastSessionCoordinator.launchRestoreAsync(getApplication(), e.message) { restoreErr ->
                 val combined = AudioCastSessionCoordinator.combineErrorMessages(
                     e.message ?: "The capture service could not be stopped.",
                     restoreErr

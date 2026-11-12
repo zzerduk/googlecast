@@ -133,7 +133,7 @@ object PublicApiTargetResolver {
                 ) {
                     continue
                 }
-                val entry = buildEntryFromMetadata(profile, meta)
+                val entry = buildEntryFromMetadata(context, profile, meta, accessibleProfiles)
                 if (seenSearchableKeys.add(target.toStorageKey())) {
                     searchableApps.add(entry)
                 }
@@ -146,7 +146,7 @@ object PublicApiTargetResolver {
         // Evaluate all imported/selected targets, retaining inaccessible or unverifiable ones with clear reasons
         for (target in importedTargets) {
             if (!seenCatalogKeys.add(target.toStorageKey())) continue
-            val entry = resolveSingleImportedTargetEntry(context, target, profileBySerial)
+            val entry = resolveSingleImportedTargetEntry(context, target, profileBySerial, accessibleProfiles)
             catalogApps.add(entry)
             if (entry.isInstalled && entry.isProfileRunning && seenSearchableKeys.add(target.toStorageKey())) {
                 searchableApps.add(entry)
@@ -168,14 +168,15 @@ object PublicApiTargetResolver {
         val accessibleProfiles = environment.queryAccessibleProfiles(context)
         val profileBySerial = accessibleProfiles.associateBy { it.userSerialNumber }
         return targets.map { target ->
-            resolveSingleImportedTargetEntry(context, target, profileBySerial)
+            resolveSingleImportedTargetEntry(context, target, profileBySerial, accessibleProfiles)
         }
     }
 
     private fun resolveSingleImportedTargetEntry(
         context: Context,
         target: CaptureTarget,
-        profileBySerial: Map<Long, PublicTargetEnvironment.AccessibleProfile>
+        profileBySerial: Map<Long, PublicTargetEnvironment.AccessibleProfile>,
+        accessibleProfiles: List<PublicTargetEnvironment.AccessibleProfile>
     ): TargetAppEntry {
         val profile = profileBySerial[target.userSerialNumber]
         if (profile == null) {
@@ -233,7 +234,7 @@ object PublicApiTargetResolver {
             )
         }
 
-        return buildEntryFromMetadata(profile, meta)
+        return buildEntryFromMetadata(context, profile, meta, accessibleProfiles)
     }
 
     fun resolveAndValidateTargets(
@@ -286,6 +287,19 @@ object PublicApiTargetResolver {
                 continue
             }
 
+            val crossProfileReason = verifyCrossProfileClonedFromPrimary(
+                context = context,
+                profile = profile,
+                meta = meta,
+                accessibleProfiles = accessibleProfiles
+            )
+            if (crossProfileReason != null) {
+                unavailableTargets.add(
+                    target to "${target.packageName} (${profile.label}): $crossProfileReason"
+                )
+                continue
+            }
+
             resolvedUids.add(meta.uid)
             targetUidMap[target] = meta.uid
 
@@ -323,17 +337,52 @@ object PublicApiTargetResolver {
         )
     }
 
-    private fun buildEntryFromMetadata(
+    private fun verifyCrossProfileClonedFromPrimary(
+        context: Context,
         profile: PublicTargetEnvironment.AccessibleProfile,
-        meta: PublicTargetEnvironment.PublicAppMetadata
+        meta: PublicTargetEnvironment.PublicAppMetadata,
+        accessibleProfiles: List<PublicTargetEnvironment.AccessibleProfile>
+    ): String? {
+        if (profile.isCurrentProcessUser || profile.profileType == ProfileType.PRIMARY) {
+            return null
+        }
+        if (profile.profileType != ProfileType.WORK && profile.profileType != ProfileType.CLONE) {
+            return "跨独立用户空间 (${profile.label}) 的应用不被当前进程 AudioPlaybackCapture 支持"
+        }
+        val primaryProfile = accessibleProfiles.firstOrNull {
+            it.isCurrentProcessUser || it.profileType == ProfileType.PRIMARY
+        } ?: return "无法定位主空间以核验跨空间克隆关系"
+        val primaryMeta = environment.resolveTargetApp(
+            context,
+            CaptureTarget(meta.packageName, primaryProfile.userSerialNumber)
+        )
+        val primaryBaseAppId = primaryMeta?.uid?.takeIf { it > 0 }?.rem(100_000)
+        val targetBaseAppId = meta.uid.takeIf { it > 0 }?.rem(100_000)
+        if (primaryMeta == null || primaryBaseAppId == null || primaryBaseAppId != targetBaseAppId) {
+            return "跨空间应用 ${meta.packageName} 需从主空间克隆（主空间已安装同名同源应用）方可被系统回采"
+        }
+        return null
+    }
+
+    private fun buildEntryFromMetadata(
+        context: Context,
+        profile: PublicTargetEnvironment.AccessibleProfile,
+        meta: PublicTargetEnvironment.PublicAppMetadata,
+        accessibleProfiles: List<PublicTargetEnvironment.AccessibleProfile>
     ): TargetAppEntry {
         val target = CaptureTarget(meta.packageName, profile.userSerialNumber)
         val verifiedSiblings = meta.verifiedSharedUidPackages
         val isSharedVerified = verifiedSiblings != null && meta.packageName in verifiedSiblings
+        val crossProfileReason = if (isSharedVerified && meta.uid > 0 && profile.isRunning) {
+            verifyCrossProfileClonedFromPrimary(context, profile, meta, accessibleProfiles)
+        } else {
+            null
+        }
         val reason = when {
             !profile.isRunning -> "所属空间未运行或已暂停"
             meta.uid <= 0 -> "无法核验完整 UID"
             !isSharedVerified -> "无 Shizuku 时无法通过公开 API 完整校验共享 UID"
+            crossProfileReason != null -> crossProfileReason
             else -> null
         }
         return TargetAppEntry(
@@ -346,7 +395,7 @@ object PublicApiTargetResolver {
             isSystemApp = meta.isSystemApp,
             resolvedUid = meta.uid.takeIf { it > 0 },
             sharedUidPackages = verifiedSiblings.orEmpty(),
-            isIdentityVerified = meta.uid > 0,
+            isIdentityVerified = meta.uid > 0 && crossProfileReason == null,
             isSharedUidVerified = isSharedVerified,
             statusReason = reason,
             appCategory = meta.appCategory
@@ -568,12 +617,22 @@ internal object AndroidPublicTargetEnvironment : PublicTargetEnvironment {
             return fromGetPackages
         }
 
-        // In the current process user, if getPackagesForUid did not populate (e.g. unit test shadow),
-        // verify via PackageInfo.sharedUserId whether this package declares a shared UID.
-        if (isCurrentProcessUser) {
-            val pkgInfo = runCatching { pm.getPackageInfo(pkg, 0) }.getOrNull()
-            if (pkgInfo != null && pkgInfo.sharedUserId.isNullOrBlank()) {
+        // In the current process user, or when a work/clone app is cloned from the primary space
+        // with matching base appId, verify via primary PackageInfo.sharedUserId whether it declares a shared UID.
+        val pkgInfo = runCatching { pm.getPackageInfo(pkg, 0) }.getOrNull()
+        val primaryAppInfo = pkgInfo?.applicationInfo
+            ?: runCatching { pm.getApplicationInfo(pkg, 0) }.getOrNull()
+        if (pkgInfo != null && pkgInfo.sharedUserId.isNullOrBlank()) {
+            if (isCurrentProcessUser) {
                 return listOf(pkg)
+            }
+            if (primaryAppInfo != null && primaryAppInfo.uid > 0 &&
+                (primaryAppInfo.uid % 100_000) == (fullUid % 100_000)
+            ) {
+                val primarySiblings = runCatching {
+                    pm.getPackagesForUid(primaryAppInfo.uid)?.filter { it.isNotBlank() }?.sorted()
+                }.getOrNull().orEmpty()
+                return if (primarySiblings.size <= 1) listOf(pkg) else null
             }
         }
 

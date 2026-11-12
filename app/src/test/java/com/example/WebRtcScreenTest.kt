@@ -351,6 +351,114 @@ class WebRtcScreenTest {
         compose.onNodeWithTag("capture_error_text").assertExists()
     }
 
+    @Test
+    fun targetCardSubtitleReflectsSelectedOutputModeAndDiagnosticsCardAllowsManualCollapseDuringAlerts() {
+        var currentMode by mutableStateOf(PhoneOutputMode.SHIZUKU_SESSION_MUTE)
+        var currentError by mutableStateOf<String?>(null)
+
+        compose.setContent {
+            MyApplicationTheme {
+                ScreenCastAudioScreen(
+                    config = AudioStreamConfig(),
+                    telemetry = AudioPipelineTelemetry(
+                        activeOutputMode = currentMode,
+                        error = currentError
+                    ),
+                    logs = emptyList(),
+                    castStatus = CastSdkSessionStatus(isAvailable = true),
+                    isRequestingCapture = false,
+                    castButton = { Text("Cast", Modifier.testTag("cast_selector_slot")) },
+                    onStartCastClicked = {},
+                    onStopCastClicked = {},
+                    catalogApps = emptyList(),
+                    searchableApps = emptyList(),
+                    profiles = listOf(
+                        UserProfileInfo(0L, 0, "主空间 (User 0)", ProfileType.PRIMARY, true)
+                    )
+                )
+            }
+        }
+
+        compose.onNodeWithTag("screencast_main_list")
+            .performScrollToNode(hasTestTag("target_app_selector_card"))
+        compose.onNodeWithText(PhoneOutputMode.SHIZUKU_SESSION_MUTE.targetCardSummary, substring = true).assertExists()
+
+        // Switching output mode updates the target card subtitle dynamically
+        currentMode = PhoneOutputMode.CAPTURE_ONLY_UNMUTED
+        compose.waitForIdle()
+        compose.onNodeWithText(PhoneOutputMode.CAPTURE_ONLY_UNMUTED.targetCardSummary, substring = true).assertExists()
+
+        currentMode = PhoneOutputMode.GLOBAL_MEDIA_MUTE
+        compose.waitForIdle()
+        compose.onNodeWithText(PhoneOutputMode.GLOBAL_MEDIA_MUTE.targetCardSummary, substring = true).assertExists()
+
+        // Scroll to diagnostics card; initially collapsed when no alert
+        compose.onNodeWithTag("screencast_main_list")
+            .performScrollToNode(hasTestTag("diagnostics_drawer_card"))
+        compose.onNodeWithTag("gate_verification_card").assertDoesNotExist()
+
+        // New alert arrives -> auto-expands diagnostics panel
+        currentError = "测试告警：混音器静音门禁超时"
+        compose.waitForIdle()
+        compose.onNodeWithTag("gate_verification_card").assertExists()
+
+        // Clicking header while alert is active manually collapses the panel
+        compose.onNodeWithTag("diagnostics_expand_toggle").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("gate_verification_card").assertDoesNotExist()
+    }
+
+    @Test
+    fun manualPackageImportShowsProfileSelectorAndResetsToPrimaryWhenSwitchingBackToAllSpaces() {
+        var importedPackage: String? = null
+        var importedSerial: Long? = null
+
+        compose.setContent {
+            MyApplicationTheme {
+                ScreenCastAudioScreen(
+                    config = AudioStreamConfig(),
+                    telemetry = AudioPipelineTelemetry(),
+                    logs = emptyList(),
+                    castStatus = CastSdkSessionStatus(isAvailable = true),
+                    isRequestingCapture = false,
+                    castButton = { Text("Cast", Modifier.testTag("cast_selector_slot")) },
+                    onStartCastClicked = {},
+                    onStopCastClicked = {},
+                    catalogApps = emptyList(),
+                    searchableApps = emptyList(),
+                    profiles = listOf(
+                        UserProfileInfo(0L, 0, "主空间 (User 0)", ProfileType.PRIMARY, true),
+                        UserProfileInfo(10L, 10, "工作资料 (User 10)", ProfileType.WORK, true)
+                    ),
+                    onImportTargetApp = { pkg, serial ->
+                        importedPackage = pkg
+                        importedSerial = serial
+                    }
+                )
+            }
+        }
+
+        compose.onNodeWithTag("screencast_main_list")
+            .performScrollToNode(hasTestTag("open_import_target_dialog_button"))
+        compose.onNodeWithTag("open_import_target_dialog_button").performClick()
+
+        // Select Work Profile tab (10L), then switch back to "全部空间"
+        compose.onNodeWithTag("import_profile_chip_10").performClick()
+        compose.onNodeWithTag("import_profile_chip_all").performClick()
+
+        // Open manual package import panel
+        compose.onNodeWithTag("toggle_manual_package_input_button").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("manual_import_profile_selector").assertExists()
+
+        // Without touching manual profile chips, importing under "全部空间" uses primary profile (0L), NOT stale 10L
+        compose.onNodeWithTag("import_package_input").performTextReplacement("com.example.customplayer")
+        compose.onNodeWithTag("confirm_import_target_button").performClick()
+        compose.waitForIdle()
+        assertEquals("com.example.customplayer", importedPackage)
+        assertEquals(0L, importedSerial)
+    }
+
     private fun showScreen(
         telemetry: AudioPipelineTelemetry = AudioPipelineTelemetry(),
         muteTelemetry: SessionMuteTelemetry = SessionMuteTelemetry(),

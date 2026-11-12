@@ -123,6 +123,7 @@ class WebRtcAudioSession internal constructor(
     private val offerSent = CompletableDeferred<Unit>()
     private val cleanupStarted = AtomicBoolean(false)
     private val cleanupTimedOut = AtomicBoolean(false)
+    private val cleanupFailed = AtomicBoolean(false)
     private val timeoutCallbacksEmitted = AtomicBoolean(false)
     private val cleanupOutcome = CompletableDeferred<CleanupOutcome>()
 
@@ -142,6 +143,9 @@ class WebRtcAudioSession internal constructor(
 
     internal val isCleanupTimedOut: Boolean
         get() = cleanupTimedOut.get()
+
+    internal val isCleanupFailed: Boolean
+        get() = cleanupFailed.get()
 
     internal val isCleanupWorkerAlive: Boolean
         get() = cleanupWorkerThread?.isAlive == true
@@ -286,11 +290,8 @@ class WebRtcAudioSession internal constructor(
                 throw outcome.exception
             }
             is CleanupOutcome.Failed -> {
-                if (failure is WebRtcCleanupTimeoutException) {
-                    onStage(WebRtcStage.CLEANUP_TIMEOUT)
-                } else {
-                    onStage(WebRtcStage.ERROR)
-                }
+                cleanupFailed.set(true)
+                onStage(WebRtcStage.CLEANUP_TIMEOUT)
                 onError(message)
                 if (failure !== outcome.error) {
                     failure.addSuppressed(outcome.error)
@@ -334,7 +335,10 @@ class WebRtcAudioSession internal constructor(
         // 4. Bounded wait for native cleanup result.
         when (val outcome = cleanupDeferred.await()) {
             is CleanupOutcome.Completed -> Unit
-            is CleanupOutcome.Failed -> throw outcome.error
+            is CleanupOutcome.Failed -> {
+                cleanupFailed.set(true)
+                throw outcome.error
+            }
             is CleanupOutcome.TimedOut -> {
                 emitTimeoutCallbacksOnMain(outcome)
                 throw outcome.exception
@@ -463,6 +467,7 @@ class WebRtcAudioSession internal constructor(
                         }
                     }
                     is CleanupOutcome.Failed -> {
+                        cleanupFailed.set(true)
                         if (!cleanupTimedOut.get()) {
                             cleanupOutcome.complete(result)
                         }

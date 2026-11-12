@@ -62,8 +62,10 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
+import android.util.LruCache
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -88,6 +90,7 @@ import androidx.compose.material.icons.filled.Bookmarks
 import androidx.compose.material.icons.filled.Close
 import io.github.ddagunts.screencast.media.AudioPipelineTelemetry
 import io.github.ddagunts.screencast.target.CaptureTarget
+import io.github.ddagunts.screencast.target.PhoneOutputMode
 import io.github.ddagunts.screencast.target.ProfileType
 import io.github.ddagunts.screencast.target.SessionMuteTelemetry
 import io.github.ddagunts.screencast.target.TargetAppEntry
@@ -95,7 +98,6 @@ import io.github.ddagunts.screencast.target.TargetPreset
 import io.github.ddagunts.screencast.target.UserProfileInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -105,6 +107,7 @@ fun TargetAppSelectorCard(
     selectedTargets: Set<CaptureTarget>,
     importedTargets: Set<CaptureTarget>,
     presets: List<TargetPreset> = emptyList(),
+    activeOutputMode: PhoneOutputMode = PhoneOutputMode.SHIZUKU_SESSION_MUTE,
     isEditingLocked: Boolean,
     onToggleTarget: (CaptureTarget) -> Unit,
     onClearTargets: () -> Unit,
@@ -162,9 +165,10 @@ fun TargetAppSelectorCard(
                             fontWeight = FontWeight.SemiBold
                         )
                         Text(
-                            text = "已勾选 ${selectedTargets.size} / ${catalogApps.size} 个空间实例 • 完整 UID 白名单采集 + 会话静音",
+                            text = "已勾选 ${selectedTargets.size} / ${catalogApps.size} 个空间实例 • ${activeOutputMode.targetCardSummary}",
                             style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.testTag("target_card_output_mode_subtitle")
                         )
                     }
                 }
@@ -287,160 +291,188 @@ fun TargetAppSelectorCard(
                     }
                 }
             } else {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    catalogApps.forEach { entry ->
-                        val isSelected = entry.target in selectedTargets
-                        val isImported = entry.target in importedTargets
-                        val canInteract = (entry.isSelectable || isSelected) && !isEditingLocked
-                        val sharedSiblingsWarning = if (entry.sharedUidPackages.size > 1) {
-                            val unselectedSiblings = entry.sharedUidPackages.filter { pkg ->
-                                CaptureTarget(pkg, entry.target.userSerialNumber) !in selectedTargets
-                            }
-                            if (isSelected && unselectedSiblings.isNotEmpty()) {
-                                "共享 UID 含未选包: ${unselectedSiblings.joinToString(", ")} (禁止启动)"
-                            } else {
-                                "共享 UID 共 ${entry.sharedUidPackages.size} 个包"
-                            }
-                        } else null
-
-                        Surface(
-                            shape = RoundedCornerShape(14.dp),
-                            color = when {
-                                !entry.isSelectable ->
-                                    MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.22f)
-                                isSelected ->
-                                    MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
-                                else ->
-                                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
-                            },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(14.dp))
-                                .border(
-                                    width = 1.dp,
-                                    color = if (isSelected) MaterialTheme.colorScheme.primary
-                                    else MaterialTheme.colorScheme.surfaceVariant,
-                                    shape = RoundedCornerShape(14.dp)
-                                )
-                                .clickable(enabled = canInteract) { onToggleTarget(entry.target) }
-                                .testTag("target_app_item_${entry.target.toStorageKey()}")
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Row(
-                                    modifier = Modifier.weight(1f),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                                ) {
-                                    AppIconThumbnail(
-                                        packageName = entry.target.packageName,
-                                        userSerialNumber = entry.target.userSerialNumber,
-                                        appLabel = entry.appLabel,
-                                        size = 42.dp
-                                    )
-
-                                    Column(
-                                        modifier = Modifier.weight(1f),
-                                        verticalArrangement = Arrangement.spacedBy(4.dp)
-                                    ) {
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                        ) {
-                                            Text(
-                                                text = entry.appLabel,
-                                                style = MaterialTheme.typography.titleSmall,
-                                                fontWeight = FontWeight.SemiBold,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                                modifier = Modifier.weight(1f, fill = false)
-                                            )
-                                            ProfileBadge(
-                                                profileType = entry.profileType,
-                                                serialNumber = entry.target.userSerialNumber
-                                            )
-                                        }
-
-                                        Text(
-                                            text = buildString {
-                                                append(entry.target.packageName)
-                                                append(" • user#${entry.target.userSerialNumber}")
-                                                if (entry.resolvedUid != null) {
-                                                    append(" • UID ${entry.resolvedUid}")
-                                                }
-                                            },
-                                            style = MaterialTheme.typography.labelSmall,
-                                            fontFamily = FontFamily.Monospace,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-
-                                        entry.statusReason?.let { reason ->
-                                            Row(
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.Filled.Block,
-                                                    contentDescription = reason,
-                                                    tint = MaterialTheme.colorScheme.error,
-                                                    modifier = Modifier.size(14.dp)
-                                                )
-                                                Text(
-                                                    text = reason,
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = MaterialTheme.colorScheme.error
-                                                )
-                                            }
-                                        }
-
-                                        sharedSiblingsWarning?.let { warning ->
-                                            Text(
-                                                text = warning,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = if (warning.contains("禁止启动")) {
-                                                    MaterialTheme.colorScheme.error
-                                                } else {
-                                                    MaterialTheme.colorScheme.secondary
-                                                }
-                                            )
-                                        }
-                                    }
-                                }
-
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(2.dp)
-                                ) {
-                                    if (isImported && !isEditingLocked) {
-                                        IconButton(
-                                            onClick = { onRemoveImportedTarget(entry.target) },
-                                            modifier = Modifier.testTag("remove_imported_${entry.target.toStorageKey()}")
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Filled.DeleteOutline,
-                                                contentDescription = "从目标列表移除",
-                                                tint = MaterialTheme.colorScheme.onSurfaceVariant
-                                            )
-                                        }
-                                    }
-                                    Checkbox(
-                                        checked = isSelected,
-                                        onCheckedChange = if (canInteract) {
-                                            { onToggleTarget(entry.target) }
-                                        } else null,
-                                        enabled = canInteract,
-                                        modifier = Modifier.testTag("checkbox_${entry.target.toStorageKey()}")
-                                    )
-                                }
-                            }
-                        }
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 360.dp)
+                        .testTag("target_app_lazy_list"),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(
+                        items = catalogApps,
+                        key = { it.target.toStorageKey() }
+                    ) { entry ->
+                        TargetAppRowItem(
+                            entry = entry,
+                            selectedTargets = selectedTargets,
+                            importedTargets = importedTargets,
+                            isEditingLocked = isEditingLocked,
+                            onToggleTarget = onToggleTarget,
+                            onRemoveImportedTarget = onRemoveImportedTarget
+                        )
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TargetAppRowItem(
+    entry: TargetAppEntry,
+    selectedTargets: Set<CaptureTarget>,
+    importedTargets: Set<CaptureTarget>,
+    isEditingLocked: Boolean,
+    onToggleTarget: (CaptureTarget) -> Unit,
+    onRemoveImportedTarget: (CaptureTarget) -> Unit
+) {
+    val isSelected = entry.target in selectedTargets
+    val isImported = entry.target in importedTargets
+    val canInteract = (entry.isSelectable || isSelected) && !isEditingLocked
+    val sharedSiblingsWarning = if (entry.sharedUidPackages.size > 1) {
+        val unselectedSiblings = entry.sharedUidPackages.filter { pkg ->
+            CaptureTarget(pkg, entry.target.userSerialNumber) !in selectedTargets
+        }
+        if (isSelected && unselectedSiblings.isNotEmpty()) {
+            "共享 UID 含未选包: ${unselectedSiblings.joinToString(", ")} (禁止启动)"
+        } else {
+            "共享 UID 共 ${entry.sharedUidPackages.size} 个包"
+        }
+    } else null
+
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = when {
+            !entry.isSelectable ->
+                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.22f)
+            isSelected ->
+                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+            else ->
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+        },
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .border(
+                width = 1.dp,
+                color = if (isSelected) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(14.dp)
+            )
+            .clickable(enabled = canInteract) { onToggleTarget(entry.target) }
+            .testTag("target_app_item_${entry.target.toStorageKey()}")
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                AppIconThumbnail(
+                    packageName = entry.target.packageName,
+                    userSerialNumber = entry.target.userSerialNumber,
+                    appLabel = entry.appLabel,
+                    size = 42.dp
+                )
+
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = entry.appLabel,
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+                        ProfileBadge(
+                            profileType = entry.profileType,
+                            serialNumber = entry.target.userSerialNumber
+                        )
+                    }
+
+                    Text(
+                        text = buildString {
+                            append(entry.target.packageName)
+                            append(" • user#${entry.target.userSerialNumber}")
+                            if (entry.resolvedUid != null) {
+                                append(" • UID ${entry.resolvedUid}")
+                            }
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+
+                    entry.statusReason?.let { reason ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Block,
+                                contentDescription = reason,
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = reason,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+
+                    sharedSiblingsWarning?.let { warning ->
+                        Text(
+                            text = warning,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (warning.contains("禁止启动")) {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                MaterialTheme.colorScheme.secondary
+                            }
+                        )
+                    }
+                }
+            }
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                if (isImported && !isEditingLocked) {
+                    IconButton(
+                        onClick = { onRemoveImportedTarget(entry.target) },
+                        modifier = Modifier.testTag("remove_imported_${entry.target.toStorageKey()}")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.DeleteOutline,
+                            contentDescription = "从目标列表移除",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                Checkbox(
+                    checked = isSelected,
+                    onCheckedChange = if (canInteract) {
+                        { onToggleTarget(entry.target) }
+                    } else null,
+                    enabled = canInteract,
+                    modifier = Modifier.testTag("checkbox_${entry.target.toStorageKey()}")
+                )
             }
         }
     }
@@ -691,7 +723,23 @@ fun ProfileBadge(
 }
 
 internal object AppIconLoader {
-    private val memoryCache = ConcurrentHashMap<String, ImageBitmap>()
+    const val DEFAULT_MAX_CACHE_BYTES: Int = 4 * 1024 * 1024 // 4 MB
+    const val MAX_ICON_DIMENSION_PX: Int = 96
+
+    private val cacheLock = Any()
+
+    @Volatile
+    private var maxCacheBytes: Int = DEFAULT_MAX_CACHE_BYTES
+
+    private var memoryCache: LruCache<String, ImageBitmap> = createLruCache(DEFAULT_MAX_CACHE_BYTES)
+
+    private fun createLruCache(maxBytes: Int): LruCache<String, ImageBitmap> {
+        return object : LruCache<String, ImageBitmap>(maxBytes.coerceAtLeast(1024)) {
+            override fun sizeOf(key: String, value: ImageBitmap): Int {
+                return (value.width * value.height * 4).coerceAtLeast(1)
+            }
+        }
+    }
 
     @Volatile
     var onLoadIconHookForTesting: ((packageName: String, userSerialNumber: Long, threadName: String) -> Unit)? = null
@@ -699,11 +747,30 @@ internal object AppIconLoader {
     @Volatile
     var customIconProviderForTesting: ((Context, String, Long) -> ImageBitmap?)? = null
 
+    fun setMaxCacheBytesForTesting(maxBytes: Int) {
+        synchronized(cacheLock) {
+            maxCacheBytes = maxBytes.coerceAtLeast(1024)
+            memoryCache = createLruCache(maxCacheBytes)
+        }
+    }
+
+    fun cacheSizeBytesForTesting(): Int = synchronized(cacheLock) { memoryCache.size() }
+
+    fun cacheEntryCountForTesting(): Int = synchronized(cacheLock) { memoryCache.snapshot().size }
+
     fun clearCacheForTesting() {
-        memoryCache.clear()
+        synchronized(cacheLock) {
+            maxCacheBytes = DEFAULT_MAX_CACHE_BYTES
+            memoryCache = createLruCache(DEFAULT_MAX_CACHE_BYTES)
+        }
         onLoadIconHookForTesting = null
         customIconProviderForTesting = null
     }
+
+    fun drawableToImageBitmapForTesting(
+        drawable: Drawable,
+        targetPx: Int = MAX_ICON_DIMENSION_PX
+    ): ImageBitmap? = drawable.toImageBitmap(targetPx)
 
     suspend fun loadIconAsync(
         context: Context,
@@ -711,13 +778,15 @@ internal object AppIconLoader {
         userSerialNumber: Long
     ): ImageBitmap? {
         val key = "$userSerialNumber:$packageName"
-        memoryCache[key]?.let { return it }
+        synchronized(cacheLock) { memoryCache.get(key) }?.let { return it }
         return withContext(Dispatchers.IO) {
             onLoadIconHookForTesting?.invoke(packageName, userSerialNumber, Thread.currentThread().name)
             val loaded = customIconProviderForTesting?.invoke(context, packageName, userSerialNumber)
                 ?: loadAppIconBitmap(context, packageName, userSerialNumber)
             if (loaded != null) {
-                memoryCache[key] = loaded
+                synchronized(cacheLock) {
+                    memoryCache.put(key, loaded)
+                }
             }
             loaded
         }
@@ -805,13 +874,31 @@ private fun loadAppIconBitmap(
     }
 }
 
-private fun Drawable.toImageBitmap(targetPx: Int = 96): ImageBitmap? {
+internal fun Drawable.toImageBitmap(targetPx: Int = AppIconLoader.MAX_ICON_DIMENSION_PX): ImageBitmap? {
     return try {
+        val maxPx = targetPx.coerceAtLeast(1)
         if (this is BitmapDrawable && bitmap != null) {
-            return bitmap.asImageBitmap()
+            val src = bitmap
+            if (src.width <= maxPx && src.height <= maxPx) {
+                return src.asImageBitmap()
+            }
+            val scale = minOf(
+                maxPx.toFloat() / src.width.coerceAtLeast(1).toFloat(),
+                maxPx.toFloat() / src.height.coerceAtLeast(1).toFloat()
+            )
+            val scaledW = (src.width * scale).roundToInt().coerceIn(1, maxPx)
+            val scaledH = (src.height * scale).roundToInt().coerceIn(1, maxPx)
+            return Bitmap.createScaledBitmap(src, scaledW, scaledH, true).asImageBitmap()
         }
-        val width = intrinsicWidth.coerceIn(1, targetPx)
-        val height = intrinsicHeight.coerceIn(1, targetPx)
+        val rawW = if (intrinsicWidth > 0) intrinsicWidth else maxPx
+        val rawH = if (intrinsicHeight > 0) intrinsicHeight else maxPx
+        val scale = minOf(
+            1f,
+            maxPx.toFloat() / rawW.toFloat(),
+            maxPx.toFloat() / rawH.toFloat()
+        )
+        val width = (rawW * scale).roundToInt().coerceIn(1, maxPx)
+        val height = (rawH * scale).roundToInt().coerceIn(1, maxPx)
         val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         setBounds(0, 0, canvas.width, canvas.height)
@@ -968,7 +1055,10 @@ fun VisualAppPickerBottomSheet(
             ) {
                 FilterChip(
                     selected = selectedProfileFilter == -1L,
-                    onClick = { selectedProfileFilter = -1L },
+                    onClick = {
+                        selectedProfileFilter = -1L
+                        manualSerial = defaultManualSerial
+                    },
                     label = { Text("全部空间", style = MaterialTheme.typography.labelSmall) },
                     modifier = Modifier.testTag("import_profile_chip_all")
                 )
@@ -998,6 +1088,14 @@ fun VisualAppPickerBottomSheet(
 
             // Collapsible Manual Package Input Section
             AnimatedVisibility(visible = showManualInput) {
+                val effectiveManualSerial = if (selectedProfileFilter != -1L) {
+                    selectedProfileFilter
+                } else {
+                    manualSerial
+                }
+                val selectedManualProfile = profiles.firstOrNull {
+                    it.userSerialNumber == effectiveManualSerial
+                }
                 Surface(
                     shape = RoundedCornerShape(12.dp),
                     color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
@@ -1012,6 +1110,47 @@ fun VisualAppPickerBottomSheet(
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.primary
                         )
+                        Text(
+                            text = buildString {
+                                append("导入目标所属空间：")
+                                if (selectedManualProfile != null) {
+                                    append("${selectedManualProfile.profileType.badgeLabel} (S${selectedManualProfile.userSerialNumber})")
+                                } else {
+                                    append("S$effectiveManualSerial")
+                                }
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.testTag("manual_import_selected_profile_text")
+                        )
+                        if (profiles.isNotEmpty()) {
+                            FlowRow(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("manual_import_profile_selector"),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                profiles.forEach { profile ->
+                                    FilterChip(
+                                        selected = effectiveManualSerial == profile.userSerialNumber,
+                                        onClick = {
+                                            manualSerial = profile.userSerialNumber
+                                            if (selectedProfileFilter != -1L) {
+                                                selectedProfileFilter = profile.userSerialNumber
+                                            }
+                                        },
+                                        label = {
+                                            Text(
+                                                text = "${profile.profileType.badgeLabel} (S${profile.userSerialNumber})",
+                                                style = MaterialTheme.typography.labelSmall
+                                            )
+                                        },
+                                        modifier = Modifier.testTag("manual_import_profile_chip_${profile.userSerialNumber}")
+                                    )
+                                }
+                            }
+                        }
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
@@ -1030,12 +1169,7 @@ fun VisualAppPickerBottomSheet(
                                 onClick = {
                                     val pkg = manualPackageName.trim()
                                     if (pkg.isNotEmpty()) {
-                                        val targetSerial = if (selectedProfileFilter != -1L) {
-                                            selectedProfileFilter
-                                        } else {
-                                            manualSerial
-                                        }
-                                        onAddTargetApp(pkg, targetSerial)
+                                        onAddTargetApp(pkg, effectiveManualSerial)
                                         manualPackageName = ""
                                     }
                                 },
@@ -1215,12 +1349,21 @@ fun CollapsibleDiagnosticsCard(
     muteTelemetry: SessionMuteTelemetry,
     logs: List<String>
 ) {
-    val hasAlert = telemetry.error != null ||
-        muteTelemetry.muteFailureReason != null ||
-        muteTelemetry.pendingRestoreCount > 0 ||
-        muteTelemetry.isNewTrackLatencyWithinGate == false
-    var expanded by rememberSaveable { mutableStateOf(false) }
-    val isExpanded = expanded || hasAlert
+    val alertSignature = buildString {
+        if (telemetry.error != null) append("err:${telemetry.error}|")
+        if (muteTelemetry.muteFailureReason != null) append("mute:${muteTelemetry.muteFailureReason}|")
+        if (muteTelemetry.pendingRestoreCount > 0) append("restore:${muteTelemetry.pendingRestoreCount}|")
+        if (muteTelemetry.isNewTrackLatencyWithinGate == false) append("lat:fail|")
+    }
+    var expanded by rememberSaveable { mutableStateOf(alertSignature.isNotEmpty()) }
+    var lastObservedAlertSignature by rememberSaveable { mutableStateOf(alertSignature) }
+
+    LaunchedEffect(alertSignature) {
+        if (alertSignature.isNotEmpty() && alertSignature != lastObservedAlertSignature) {
+            expanded = true
+        }
+        lastObservedAlertSignature = alertSignature
+    }
 
     Card(
         modifier = Modifier
@@ -1237,7 +1380,7 @@ fun CollapsibleDiagnosticsCard(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(10.dp))
-                    .clickable { expanded = !isExpanded }
+                    .clickable { expanded = !expanded }
                     .padding(vertical = 4.dp)
                     .testTag("diagnostics_expand_toggle"),
                 verticalAlignment = Alignment.CenterVertically,
@@ -1277,13 +1420,13 @@ fun CollapsibleDiagnosticsCard(
                 ) {
                     GateStatusPill(muteTelemetry = muteTelemetry)
                     Icon(
-                        imageVector = if (isExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
-                        contentDescription = if (isExpanded) "收起诊断面板" else "展开诊断面板"
+                        imageVector = if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                        contentDescription = if (expanded) "收起诊断面板" else "展开诊断面板"
                     )
                 }
             }
 
-            AnimatedVisibility(visible = isExpanded) {
+            AnimatedVisibility(visible = expanded) {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
                     GateVerificationTelemetryContent(

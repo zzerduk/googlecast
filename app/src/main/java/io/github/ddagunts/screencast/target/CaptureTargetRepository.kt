@@ -675,12 +675,18 @@ object CaptureTargetRepository {
         activeConsumerJob?.join()
         extendedCatalogLoadJob?.join()
         presetResolutionJob?.join()
+        persistenceJob?.join()
         var attempts = 0
-        while (lastCompletedRequestVersion.get() < latestRequestVersion.get() && attempts < 100) {
+        while (
+            (lastCompletedRequestVersion.get() < latestRequestVersion.get() ||
+                lastPersistedVersion.get() < latestPersistenceVersion.get()) &&
+            attempts < 100
+        ) {
             kotlinx.coroutines.delay(10L)
             attempts++
         }
         scanConsumerMutex.withLock { }
+        persistenceMutex.withLock { }
     }
 
     internal fun flushAndReloadForTesting(context: Context) {
@@ -689,10 +695,16 @@ object CaptureTargetRepository {
         val importedSnapshot = _importedTargets.value.map { it.toStorageKey() }.toSet()
         val presetsJson = encodePresetsJson(_presets.value)
         runBlocking {
-            appContext.captureTargetsDataStore.edit { prefs ->
-                prefs[KEY_SELECTED_TARGETS] = selectedSnapshot
-                prefs[KEY_IMPORTED_TARGETS] = importedSnapshot
-                prefs[KEY_TARGET_PRESETS_JSON] = presetsJson
+            persistenceJob?.join()
+            persistenceMutex.withLock {
+                val ver = latestPersistenceVersion.incrementAndGet()
+                persistenceWriteInterceptorForTesting?.invoke(ver, selectedSnapshot, presetsJson)
+                appContext.captureTargetsDataStore.edit { prefs ->
+                    prefs[KEY_SELECTED_TARGETS] = selectedSnapshot
+                    prefs[KEY_IMPORTED_TARGETS] = importedSnapshot
+                    prefs[KEY_TARGET_PRESETS_JSON] = presetsJson
+                }
+                lastPersistedVersion.set(ver)
             }
             hasExplicitInMemoryMutation = false
             _selectedTargets.value = emptySet()
@@ -709,13 +721,18 @@ object CaptureTargetRepository {
         presetResolutionJob = null
         activeConsumerJob?.cancel()
         activeConsumerJob = null
+        persistenceJob?.cancel()
+        persistenceJob = null
         catalogScanInterceptorForTesting = null
+        persistenceWriteInterceptorForTesting = null
         initialized = false
         initialLoadInProgress = false
         initialScanCompleted = false
         hasExplicitInMemoryMutation = false
         val currentVer = latestRequestVersion.incrementAndGet()
         lastCompletedRequestVersion.set(currentVer)
+        val persistVer = latestPersistenceVersion.incrementAndGet()
+        lastPersistedVersion.set(persistVer)
         while (catalogRequestChannel.tryReceive().isSuccess) {
             // Drain any pending requests
         }
@@ -774,16 +791,45 @@ object CaptureTargetRepository {
         }.getOrDefault(emptyList())
     }
 
+    private val persistenceMutex = Mutex()
+    private val latestPersistenceVersion = AtomicLong(0L)
+    private val lastPersistedVersion = AtomicLong(0L)
+
+    @Volatile
+    private var persistenceJob: Job? = null
+
+    @Volatile
+    internal var persistenceWriteInterceptorForTesting: (suspend (Long, Set<String>, String) -> Unit)? = null
+
     private fun persistSelectionsAsync(appContext: Context) {
-        val selectedSnapshot = _selectedTargets.value.map { it.toStorageKey() }.toSet()
-        val importedSnapshot = _importedTargets.value.map { it.toStorageKey() }.toSet()
-        val presetsJson = encodePresetsJson(_presets.value)
-        repoScope.launch {
-            runCatching {
-                appContext.captureTargetsDataStore.edit { prefs ->
-                    prefs[KEY_SELECTED_TARGETS] = selectedSnapshot
-                    prefs[KEY_IMPORTED_TARGETS] = importedSnapshot
-                    prefs[KEY_TARGET_PRESETS_JSON] = presetsJson
+        latestPersistenceVersion.incrementAndGet()
+        persistenceJob = repoScope.launch {
+            persistenceMutex.withLock {
+                while (lastPersistedVersion.get() < latestPersistenceVersion.get()) {
+                    val targetVersion = latestPersistenceVersion.get()
+                    val selectedSnapshot = _selectedTargets.value.map { it.toStorageKey() }.toSet()
+                    val importedSnapshot = _importedTargets.value.map { it.toStorageKey() }.toSet()
+                    val presetsJson = encodePresetsJson(_presets.value)
+                    runCatching {
+                        persistenceWriteInterceptorForTesting?.invoke(
+                            targetVersion,
+                            selectedSnapshot,
+                            presetsJson
+                        )
+                        // If a newer mutation arrived while interceptor was suspended, write the latest state instead
+                        val finalVersion = latestPersistenceVersion.get()
+                        val finalSelected = _selectedTargets.value.map { it.toStorageKey() }.toSet()
+                        val finalImported = _importedTargets.value.map { it.toStorageKey() }.toSet()
+                        val finalPresetsJson = encodePresetsJson(_presets.value)
+                        appContext.captureTargetsDataStore.edit { prefs ->
+                            prefs[KEY_SELECTED_TARGETS] = finalSelected
+                            prefs[KEY_IMPORTED_TARGETS] = finalImported
+                            prefs[KEY_TARGET_PRESETS_JSON] = finalPresetsJson
+                        }
+                        lastPersistedVersion.set(finalVersion)
+                    }.onFailure {
+                        lastPersistedVersion.set(targetVersion)
+                    }
                 }
             }
         }

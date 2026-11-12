@@ -1,6 +1,0 @@
-{
-  "summary":  "涵盖投音备选输出模式（PhoneOutputMode 与无 Shizuku 启动选择弹窗、整体媒体静音持久化与恢复、VolumeShaper CLOSE 真正撤除）、无 Shizuku 独立目标解析、多组命名目标组合（TargetPreset 卡片内嵌胶囊栏）以及主界面独立音箱音量/静音控制卡片的完整架构与交互方案。",
-  "updatedAt":  "2026-11-08T05:03:41.222327583Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}

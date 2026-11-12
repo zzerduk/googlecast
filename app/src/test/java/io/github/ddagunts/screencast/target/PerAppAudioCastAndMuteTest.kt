@@ -237,11 +237,326 @@ class PerAppAudioCastAndMuteTest {
         )
         assertEquals(setOf(musicMain), viewModel.selectedTargets.value)
 
-        // Authorization failure unlocks target editing and releases mute lease immediately
+        // Authorization failure unlocks target editing and releases mute lease asynchronously off main thread
         val releasesBefore = fakeBackend.releaseCalls.get()
         viewModel.captureAuthorizationFailed("User cancelled MediaProjection dialog")
+        AudioCastSessionCoordinator.awaitPendingRestoreForTesting()
         assertFalse(viewModel.isTargetEditingLocked.value)
         assertEquals(releasesBefore + 1, fakeBackend.releaseCalls.get())
+    }
+
+    @Test
+    fun crossProfileClonedFromPrimaryTargetsAreAcceptedWhileStandaloneCrossProfileTargetsAreRejected() {
+        val shizukuService = ShizukuAudioMuteUserService()
+        shizukuService.userProfilesProvider = {
+            listOf(
+                ShizukuAudioMuteUserService.ShellUserProfile(0, 0L, "主空间 (User 0)", ProfileType.PRIMARY, true),
+                ShizukuAudioMuteUserService.ShellUserProfile(10, 10L, "工作资料 (User 10)", ProfileType.WORK, true),
+                ShizukuAudioMuteUserService.ShellUserProfile(999, 999L, "克隆资料 (User 999)", ProfileType.CLONE, true)
+            )
+        }
+        shizukuService.installedAppsProvider = { userId ->
+            when (userId) {
+                0 -> listOf(
+                    ApplicationInfo().apply {
+                        packageName = "com.cloned.music"
+                        uid = 10250
+                        category = ApplicationInfo.CATEGORY_AUDIO
+                    }
+                )
+                10 -> listOf(
+                    // Cloned from primary space (same packageName and base appId 10250)
+                    ApplicationInfo().apply {
+                        packageName = "com.cloned.music"
+                        uid = 1010250
+                        category = ApplicationInfo.CATEGORY_AUDIO
+                    },
+                    // Standalone work-only app NOT installed in primary space
+                    ApplicationInfo().apply {
+                        packageName = "com.workonly.podcast"
+                        uid = 1010333
+                        category = ApplicationInfo.CATEGORY_AUDIO
+                    }
+                )
+                999 -> listOf(
+                    ApplicationInfo().apply {
+                        packageName = "com.cloned.music"
+                        uid = 99910250
+                        category = ApplicationInfo.CATEGORY_AUDIO
+                    }
+                )
+                else -> emptyList()
+            }
+        }
+        shizukuService.packagesForUidProvider = { uid ->
+            when (uid) {
+                10250, 1010250, 99910250 -> listOf("com.cloned.music")
+                1010333 -> listOf("com.workonly.podcast")
+                else -> emptyList()
+            }
+        }
+
+        // 1. Cloned work & clone targets pass Shizuku validation
+        val validCloneJson = JSONObject(
+            shizukuService.resolveAndValidateTargets(
+                mutableListOf("com.cloned.music@10", "com.cloned.music@999")
+            )
+        )
+        assertTrue(validCloneJson.getBoolean("isValid"))
+
+        // 2. Standalone work-only app not installed in primary space is rejected
+        val invalidStandaloneJson = JSONObject(
+            shizukuService.resolveAndValidateTargets(
+                mutableListOf("com.workonly.podcast@10")
+            )
+        )
+        assertFalse(invalidStandaloneJson.getBoolean("isValid"))
+        assertTrue(invalidStandaloneJson.getString("failureReason").contains("主空间"))
+
+        // 3. Public API resolver also accepts cloned work target and rejects standalone work target
+        val primaryCloned = CaptureTarget("com.cloned.music", 0L)
+        val workCloned = CaptureTarget("com.cloned.music", 10L)
+        val workStandalone = CaptureTarget("com.workonly.podcast", 10L)
+
+        PublicApiTargetResolver.environment = FakePublicTargetEnvironment(
+            profiles = listOf(
+                PublicTargetEnvironment.AccessibleProfile(0L, 0, "主空间 (Serial 0)", ProfileType.PRIMARY, true, true),
+                PublicTargetEnvironment.AccessibleProfile(10L, 10, "工作资料 (Serial 10)", ProfileType.WORK, true, false)
+            ),
+            apps = mapOf(
+                primaryCloned to PublicTargetEnvironment.PublicAppMetadata(
+                    packageName = "com.cloned.music",
+                    userSerialNumber = 0L,
+                    appLabel = "Cloned Music",
+                    uid = 10250,
+                    isSystemApp = false,
+                    isLaunchable = true,
+                    verifiedSharedUidPackages = listOf("com.cloned.music"),
+                    appCategory = ApplicationInfo.CATEGORY_AUDIO
+                ),
+                workCloned to PublicTargetEnvironment.PublicAppMetadata(
+                    packageName = "com.cloned.music",
+                    userSerialNumber = 10L,
+                    appLabel = "Cloned Music (Work)",
+                    uid = 1010250,
+                    isSystemApp = false,
+                    isLaunchable = true,
+                    verifiedSharedUidPackages = listOf("com.cloned.music"),
+                    appCategory = ApplicationInfo.CATEGORY_AUDIO
+                ),
+                workStandalone to PublicTargetEnvironment.PublicAppMetadata(
+                    packageName = "com.workonly.podcast",
+                    userSerialNumber = 10L,
+                    appLabel = "Work Podcast",
+                    uid = 1010333,
+                    isSystemApp = false,
+                    isLaunchable = true,
+                    verifiedSharedUidPackages = listOf("com.workonly.podcast"),
+                    appCategory = ApplicationInfo.CATEGORY_AUDIO
+                )
+            )
+        )
+
+        val publicValid = PublicApiTargetResolver.resolveAndValidateTargets(app, setOf(workCloned))
+        assertTrue(publicValid.isValid)
+        assertEquals(setOf(1010250), publicValid.resolvedUids)
+
+        val publicInvalid = PublicApiTargetResolver.resolveAndValidateTargets(app, setOf(workStandalone))
+        assertFalse(publicInvalid.isValid)
+        assertTrue(publicInvalid.failureReason.orEmpty().contains("主空间"))
+    }
+
+    @Test
+    fun aospMixerMutedByMaskRequiresVolumeShaperOrClientVolumeAndRejectsMasterOrStreamMute() {
+        assertEquals(1 shl 4, ShizukuAudioMuteUserService.MUTED_BY_CLIENT_VOLUME)
+        assertEquals(1 shl 5, ShizukuAudioMuteUserService.MUTED_BY_VOLUME_SHAPER)
+
+        val service = ShizukuAudioMuteUserService()
+        val nowMs = AtomicLong(1_000L)
+        service.elapsedRealtimeProvider = { nowMs.get() }
+
+        val fakePlayerProxy = object {
+            @Suppress("unused")
+            fun applyVolumeShaper(
+                config: VolumeShaper.Configuration,
+                operation: VolumeShaper.Operation
+            ) {
+                // Advances clock so confirmation loop finishes quickly
+                nowMs.addAndGet(120L)
+            }
+        }
+
+        // 1. MUTED_BY_MASTER (1) or MUTED_BY_STREAM_VOLUME (2) alone must NOT pass mixer confirmation
+        val reportedMask = AtomicInteger(0x1 or 0x2)
+        service.playbackSessionsProvider = {
+            nowMs.addAndGet(30L)
+            listOf(
+                ShizukuAudioMuteUserService.PlaybackSessionDescriptor(
+                    piid = 91,
+                    uid = 10188,
+                    state = ShizukuAudioMuteUserService.PLAYER_STATE_STARTED,
+                    playerType = ShizukuAudioMuteUserService.PLAYER_TYPE_JAM_AUDIOTRACK,
+                    usage = AudioAttributes.USAGE_MEDIA,
+                    mutedBy = reportedMask.get(),
+                    playerProxy = fakePlayerProxy
+                )
+            )
+        }
+
+        val unconfirmedJson = JSONObject(service.acquireOrRenewMuteLease(intArrayOf(10188), 3_500L))
+        assertFalse("Stream/master mute bits (0x1/0x2) must not be accepted as VolumeShaper confirmation", unconfirmedJson.getBoolean("success"))
+
+        // 2. AOSP MUTED_BY_VOLUME_SHAPER (1 shl 5 = 0x20) is accepted
+        nowMs.set(2_000L)
+        reportedMask.set(ShizukuAudioMuteUserService.MUTED_BY_VOLUME_SHAPER)
+        val confirmedJson = JSONObject(service.acquireOrRenewMuteLease(intArrayOf(10188), 3_500L))
+        assertTrue(confirmedJson.getBoolean("success"))
+        assertEquals(1, confirmedJson.getInt("confirmedMutedPlayerCount"))
+    }
+
+    @Test
+    fun prepareCaptureRequestAcquiresLockBeforeFirstSuspendAndCleansUpOnCancellation() = runBlocking {
+        val viewModel = ScreenCastViewModel(app)
+        val musicMain = CaptureTarget("com.android.music", 0L)
+        CaptureTargetRepository.setTargetsForTesting(setOf(musicMain))
+
+        val resolveEntered = CompletableDeferred<Unit>()
+        val allowResolveProceed = CompletableDeferred<Unit>()
+        fakeBackend.onResolveTargetsHook = {
+            resolveEntered.complete(Unit)
+            runBlocking { allowResolveProceed.await() }
+        }
+
+        val firstCall = async(Dispatchers.Default) {
+            viewModel.prepareCaptureRequest(requireConnectedCastReceiver = false)
+        }
+        resolveEntered.await()
+
+        // While firstCall is suspended inside target resolution, isRequestingCapture is ALREADY true
+        assertTrue(viewModel.isRequestingCapture.value)
+
+        // Second concurrent call (double tap) must immediately return false without entering resolution
+        val secondCallResult = viewModel.prepareCaptureRequest(requireConnectedCastReceiver = false)
+        assertFalse(secondCallResult)
+
+        // Cancelling the in-flight preparation must clean up isRequestingCapture and unlock editing
+        firstCall.cancel()
+        allowResolveProceed.complete(Unit)
+        runCatching { firstCall.await() }
+        fakeBackend.onResolveTargetsHook = null
+
+        assertFalse(viewModel.isRequestingCapture.value)
+        assertFalse(viewModel.isTargetEditingLocked.value)
+    }
+
+    @Test
+    fun outOfOrderPersistenceSnapshotsNeverOverwriteNewerSelectionOrPresets() = runBlocking {
+        val appA = CaptureTarget("com.metrolist.music", 0L)
+        val appB = CaptureTarget("org.videolan.vlc", 0L)
+        CaptureTargetRepository.setTargetsForTesting(
+            selected = emptySet(),
+            imported = setOf(appA, appB),
+            presets = emptyList()
+        )
+
+        val firstWriteOrder = CopyOnWriteArrayList<Set<String>>()
+        CaptureTargetRepository.persistenceWriteInterceptorForTesting = { version, selected, _ ->
+            if (version == 1L) {
+                // Delay the earlier snapshot if it weren't serialized
+                Thread.sleep(60)
+            }
+            firstWriteOrder.add(selected)
+        }
+
+        try {
+            assertTrue(CaptureTargetRepository.toggleTargetSelection(app, appA, isEditingLocked = false))
+            assertTrue(CaptureTargetRepository.toggleTargetSelection(app, appB, isEditingLocked = false))
+            CaptureTargetRepository.flushAndReloadForTesting(app)
+            assertEquals(setOf(appA, appB), CaptureTargetRepository.selectedTargets.value)
+        } finally {
+            CaptureTargetRepository.persistenceWriteInterceptorForTesting = null
+        }
+    }
+
+    @Test
+    fun stopLeaseSerializesWithInFlightRenewalSoLateRenewalNeverReestablishesActiveLease() = runBlocking {
+        val renewalEntered = CompletableDeferred<Unit>()
+        val allowRenewalFinish = CompletableDeferred<Unit>()
+        val callCount = AtomicInteger(0)
+
+        fakeBackend.onAcquireLeaseHook = {
+            if (callCount.incrementAndGet() == 2) {
+                renewalEntered.complete(Unit)
+                runBlocking { allowRenewalFinish.await() }
+            }
+        }
+
+        try {
+            val initial = ShizukuSessionMuteController.startSessionMuteLease(
+                targetUids = setOf(10188),
+                onFatalMuteError = {}
+            )
+            assertTrue(initial.success)
+            assertTrue(ShizukuSessionMuteController.muteTelemetry.value.leaseActive)
+
+            // Simulate an in-flight renewal running concurrently with stopLeaseAndRestoreImmediately
+            val renewalJob = async(Dispatchers.IO) {
+                ShizukuSessionMuteController.runSingleRenewalForTesting()
+            }
+            renewalEntered.await()
+
+            val stopJob = async(Dispatchers.IO) {
+                ShizukuSessionMuteController.stopLeaseAndRestoreImmediately()
+            }
+            allowRenewalFinish.complete(Unit)
+            renewalJob.await()
+            stopJob.await()
+
+            assertFalse(
+                "Late renewal must never leave leaseActive=true after stopLeaseAndRestoreImmediately",
+                ShizukuSessionMuteController.muteTelemetry.value.leaseActive
+            )
+        } finally {
+            fakeBackend.onAcquireLeaseHook = null
+        }
+    }
+
+    @Test
+    fun markCleanupTimeoutAndCaptureAuthorizationFailedNeverRunPhoneRestoreOnMainThread() = runBlocking {
+        val restoreCalledOnMainThread = AtomicBoolean(false)
+        fakeBackend.onReleaseHook = {
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                restoreCalledOnMainThread.set(true)
+            }
+        }
+
+        val viewModel = ScreenCastViewModel(app)
+        val musicMain = CaptureTarget("com.android.music", 0L)
+        CaptureTargetRepository.setTargetsForTesting(setOf(musicMain))
+        assertTrue(viewModel.prepareCaptureRequest(requireConnectedCastReceiver = false))
+
+        viewModel.captureAuthorizationFailed("Cancelled on main thread")
+        AudioCastSessionCoordinator.awaitPendingRestoreForTesting()
+        assertFalse("captureAuthorizationFailed must restore audio off the main thread", restoreCalledOnMainThread.get())
+
+        AudioCastSessionCoordinator.markCleanupTimeout("Timeout on main thread")
+        AudioCastSessionCoordinator.awaitPendingRestoreForTesting()
+        assertFalse("markCleanupTimeout must restore audio off the main thread", restoreCalledOnMainThread.get())
+    }
+
+    @Test
+    fun appIconLoaderScalesOversizedBitmapDrawableAndEvictsWhenByteBudgetExceeded() {
+        val loader = io.github.ddagunts.screencast.ui.AppIconLoader
+        loader.clearCacheForTesting()
+
+        val oversizedBitmap = android.graphics.Bitmap.createBitmap(512, 512, android.graphics.Bitmap.Config.ARGB_8888)
+        val drawable = android.graphics.drawable.BitmapDrawable(app.resources, oversizedBitmap)
+        val scaledImageBitmap = requireNotNull(
+            loader.drawableToImageBitmapForTesting(drawable, targetPx = 96)
+        )
+
+        assertEquals(96, scaledImageBitmap.width)
+        assertEquals(96, scaledImageBitmap.height)
     }
 
     @Test
@@ -398,6 +713,7 @@ class PerAppAudioCastAndMuteTest {
         fakeBackend.setConnectionState(ShizukuConnectionState.UNAVAILABLE)
 
         val primaryMusic = CaptureTarget("com.metrolist.music", 0L)
+        val primaryWorkPlayerCloneSource = CaptureTarget("com.work.player", 0L)
         val workMusicUnverifiableShared = CaptureTarget("com.work.player", 15L) // Non-sequential serial 15L at index 1
         val cloneMusicInaccessible = CaptureTarget("com.metrolist.music", 999L) // Inaccessible clone profile
         val restrictedBili = CaptureTarget("tv.danmaku.bili", 0L)
@@ -431,6 +747,16 @@ class PerAppAudioCastAndMuteTest {
                     isSystemApp = false,
                     isLaunchable = true,
                     verifiedSharedUidPackages = listOf("com.metrolist.music"),
+                    appCategory = ApplicationInfo.CATEGORY_AUDIO
+                ),
+                primaryWorkPlayerCloneSource to PublicTargetEnvironment.PublicAppMetadata(
+                    packageName = "com.work.player",
+                    userSerialNumber = 0L,
+                    appLabel = "Work Player (Main)",
+                    uid = 10299,
+                    isSystemApp = false,
+                    isLaunchable = true,
+                    verifiedSharedUidPackages = listOf("com.work.player"),
                     appCategory = ApplicationInfo.CATEGORY_AUDIO
                 ),
                 workMusicUnverifiableShared to PublicTargetEnvironment.PublicAppMetadata(
@@ -1315,6 +1641,8 @@ class PerAppAudioCastAndMuteTest {
 
         val releaseCalls = AtomicInteger(0)
         var onReleaseHook: (() -> Unit)? = null
+        var onAcquireLeaseHook: (() -> Unit)? = null
+        var onResolveTargetsHook: (() -> Unit)? = null
         @Volatile var activeStartedUids: Set<Int> = emptySet()
         @Volatile var catalogAppsToReturn: List<TargetAppEntry> = emptyList()
         @Volatile var resolvedEntriesMap: Map<CaptureTarget, TargetAppEntry> = emptyMap()
@@ -1383,12 +1711,18 @@ class PerAppAudioCastAndMuteTest {
         override fun resolveAndValidateTargets(
             context: Context,
             selectedTargets: Set<CaptureTarget>
-        ): TargetResolutionResult = nextResolutionResult
+        ): TargetResolutionResult {
+            onResolveTargetsHook?.invoke()
+            return nextResolutionResult
+        }
 
         override fun acquireOrRenewLease(
             targetUids: Set<Int>,
             leaseDurationMs: Long
-        ): LeaseAcquisitionOutcome = leaseOutcomeToReturn
+        ): LeaseAcquisitionOutcome {
+            onAcquireLeaseHook?.invoke()
+            return leaseOutcomeToReturn
+        }
 
         override fun releaseLeaseImmediately(): LeaseAcquisitionOutcome {
             onReleaseHook?.invoke()

@@ -111,6 +111,12 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
             .mapNotNull { CaptureTarget.fromStorageKey(it) }
             .toSet()
         val profiles = userProfilesProvider?.invoke() ?: queryUserProfilesInternal()
+        val primaryUserId = profiles.firstOrNull { it.profileType == ProfileType.PRIMARY }?.userId ?: 0
+        val primaryInstalledMap: Map<String, ApplicationInfo> = (
+            installedAppsProvider?.invoke(primaryUserId)
+                ?: queryInstalledApplicationsForUser(primaryUserId)
+            ).mapNotNull { info -> info.packageName?.let { it to info } }.toMap()
+
         val catalogAppsArray = JSONArray()
         val allInstalledArray = JSONArray()
         val profilesArray = JSONArray()
@@ -126,8 +132,12 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
                     .put("profileType", profile.profileType.name)
                     .put("isRunning", profile.isRunning)
             )
-            val installedApps = installedAppsProvider?.invoke(profile.userId)
-                ?: queryInstalledApplicationsForUser(profile.userId)
+            val installedApps = if (profile.userId == primaryUserId && primaryInstalledMap.isNotEmpty()) {
+                primaryInstalledMap.values.toList()
+            } else {
+                installedAppsProvider?.invoke(profile.userId)
+                    ?: queryInstalledApplicationsForUser(profile.userId)
+            }
             for (appInfo in installedApps) {
                 val pkg = appInfo.packageName ?: continue
                 val target = CaptureTarget(pkg, profile.userSerialNumber)
@@ -140,9 +150,16 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
                 val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 &&
                     (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
                 val appLabel = loadAppLabelSafe(appInfo)
+                val (isClonedCapturable, crossProfileReason) = verifyCrossProfileClonedFromPrimary(
+                    profile = profile,
+                    appInfo = appInfo,
+                    primaryUserId = primaryUserId,
+                    primaryInstalledMap = primaryInstalledMap
+                )
                 val statusReason = buildStatusReason(
                     isProfileRunning = profile.isRunning,
-                    isInstalled = true
+                    isInstalled = true,
+                    crossProfileRejectReason = crossProfileReason
                 )
 
                 val itemJson = JSONObject()
@@ -157,6 +174,7 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
                     .put("appCategory", category)
                     .put("resolvedUid", fullUid)
                     .put("sharedUidPackages", JSONArray(sharedSiblings))
+                    .put("isIdentityVerified", isClonedCapturable)
                     .put("statusReason", statusReason ?: JSONObject.NULL)
 
                 if (seenSearchableTargets.add(target.toStorageKey())) {
@@ -185,9 +203,20 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
             val category = appInfo?.let { extractAppCategory(it) } ?: ApplicationInfo.CATEGORY_UNDEFINED
             val fullUid = appInfo?.uid
             val siblings = if (fullUid != null) queryPackagesForUidSafe(fullUid) else emptyList()
+            val (isClonedCapturable, crossProfileReason) = if (profile != null && appInfo != null) {
+                verifyCrossProfileClonedFromPrimary(
+                    profile = profile,
+                    appInfo = appInfo,
+                    primaryUserId = primaryUserId,
+                    primaryInstalledMap = primaryInstalledMap
+                )
+            } else {
+                false to null
+            }
             val reason = buildStatusReason(
                 isProfileRunning = isProfileRunning,
-                isInstalled = isInstalled
+                isInstalled = isInstalled,
+                crossProfileRejectReason = crossProfileReason
             )
             val itemJson = JSONObject()
                 .put("packageName", imported.packageName)
@@ -201,6 +230,7 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
                 .put("appCategory", category)
                 .put("resolvedUid", fullUid ?: JSONObject.NULL)
                 .put("sharedUidPackages", JSONArray(siblings))
+                .put("isIdentityVerified", isInstalled && isProfileRunning && isClonedCapturable)
                 .put("statusReason", reason ?: JSONObject.NULL)
 
             catalogAppsArray.put(itemJson)
@@ -228,8 +258,9 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
                 .toString()
         }
 
-        val profilesBySerial = (userProfilesProvider?.invoke() ?: queryUserProfilesInternal())
-            .associateBy { it.userSerialNumber }
+        val profiles = userProfilesProvider?.invoke() ?: queryUserProfilesInternal()
+        val primaryUserId = profiles.firstOrNull { it.profileType == ProfileType.PRIMARY }?.userId ?: 0
+        val profilesBySerial = profiles.associateBy { it.userSerialNumber }
         val resolvedUids = LinkedHashSet<Int>()
         val targetUidArray = JSONArray()
         val unavailableArray = JSONArray()
@@ -246,12 +277,32 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
                 continue
             }
             val appInfo = appInfoProvider?.invoke(target.packageName, profile.userId)
+                ?: installedAppsProvider?.invoke(profile.userId)?.firstOrNull { it.packageName == target.packageName }
                 ?: queryApplicationInfoForUser(target.packageName, profile.userId)
             if (appInfo == null) {
                 unavailableArray.put(
                     JSONObject()
                         .put("target", target.toStorageKey())
                         .put("reason", "应用 ${target.packageName} 在 ${profile.label} 中未安装")
+                )
+                continue
+            }
+
+            val (isClonedCapturable, crossProfileReason) = verifyCrossProfileClonedFromPrimary(
+                profile = profile,
+                appInfo = appInfo,
+                primaryUserId = primaryUserId,
+                primaryInstalledMap = null
+            )
+            if (!isClonedCapturable) {
+                unavailableArray.put(
+                    JSONObject()
+                        .put("target", target.toStorageKey())
+                        .put(
+                            "reason",
+                            crossProfileReason
+                                ?: "应用 ${target.packageName} (${profile.label}) 未从主空间克隆，当前采集链路无法捕获"
+                        )
                 )
                 continue
             }
@@ -1113,8 +1164,7 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
     }
 
     private fun isConfirmedMutedInMixer(mutedByMask: Int): Boolean {
-        return (mutedByMask and (MUTED_BY_VOLUME_SHAPER or MUTED_BY_CLIENT_VOLUME)) != 0 ||
-            mutedByMask != 0
+        return (mutedByMask and (MUTED_BY_VOLUME_SHAPER or MUTED_BY_CLIENT_VOLUME)) != 0
     }
 
     private fun queryUserProfilesInternal(): List<ShellUserProfile> {
@@ -1298,12 +1348,38 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         return appInfo.packageName.substringAfterLast('.').replaceFirstChar { it.uppercase() }
     }
 
+    private fun verifyCrossProfileClonedFromPrimary(
+        profile: ShellUserProfile,
+        appInfo: ApplicationInfo,
+        primaryUserId: Int,
+        primaryInstalledMap: Map<String, ApplicationInfo>?
+    ): Pair<Boolean, String?> {
+        if (profile.userId == primaryUserId || profile.profileType == ProfileType.PRIMARY) {
+            return true to null
+        }
+        if (profile.profileType != ProfileType.WORK && profile.profileType != ProfileType.CLONE) {
+            return false to "独立子用户空间 (${profile.label}) 不支持当前进程跨空间音频回采"
+        }
+        val pkg = appInfo.packageName ?: return false to "无效的应用包名"
+        val primaryAppInfo = primaryInstalledMap?.get(pkg)
+            ?: appInfoProvider?.invoke(pkg, primaryUserId)
+            ?: installedAppsProvider?.invoke(primaryUserId)?.firstOrNull { it.packageName == pkg }
+            ?: queryApplicationInfoForUser(pkg, primaryUserId)
+
+        if (primaryAppInfo == null || (primaryAppInfo.uid % 100_000) != (appInfo.uid % 100_000)) {
+            return false to "跨空间应用 $pkg 需从主空间克隆（主空间已安装同名应用）方可被系统回采"
+        }
+        return true to null
+    }
+
     private fun buildStatusReason(
         isProfileRunning: Boolean,
-        isInstalled: Boolean
+        isInstalled: Boolean,
+        crossProfileRejectReason: String? = null
     ): String? {
         if (!isInstalled) return "应用未安装"
         if (!isProfileRunning) return "所属空间未运行或已锁定"
+        if (!crossProfileRejectReason.isNullOrBlank()) return crossProfileRejectReason
         return null
     }
 
@@ -1324,7 +1400,11 @@ class ShizukuAudioMuteUserService : IShizukuAudioMuteService.Stub() {
         const val PLAYER_TYPE_NATIVE_AUDIOTRACK: Int = 11
         const val PLAYER_TYPE_AAUDIO: Int = 13
 
-        const val MUTED_BY_CLIENT_VOLUME: Int = 1 shl 2
-        const val MUTED_BY_VOLUME_SHAPER: Int = 1 shl 3
+        const val MUTED_BY_MASTER: Int = 1 shl 0
+        const val MUTED_BY_STREAM_VOLUME: Int = 1 shl 1
+        const val MUTED_BY_STREAM_MUTED: Int = 1 shl 2
+        const val MUTED_BY_APP_OPS: Int = 1 shl 3
+        const val MUTED_BY_CLIENT_VOLUME: Int = 1 shl 4
+        const val MUTED_BY_VOLUME_SHAPER: Int = 1 shl 5
     }
 }

@@ -38,22 +38,26 @@ enum class ShizukuConnectionState(val statusLabel: String) {
 enum class PhoneOutputMode(
     val badgeLabel: String,
     val shortDescription: String,
-    val impactDescription: String
+    val impactDescription: String,
+    val targetCardSummary: String
 ) {
     SHIZUKU_SESSION_MUTE(
         badgeLabel = "定向静音",
         shortDescription = "Shizuku 会话级零增益包络（仅静音所选应用）",
-        impactDescription = "仅对目标 UID 的播放轨施加专属 VolumeShaper 零增益包络，手机上未选应用的声音不受影响。"
+        impactDescription = "仅对目标 UID 的播放轨施加专属 VolumeShaper 零增益包络，手机上未选应用的声音不受影响。",
+        targetCardSummary = "完整 UID 白名单采集 + 定向会话静音"
     ),
     GLOBAL_MEDIA_MUTE(
         badgeLabel = "整体媒体静音",
         shortDescription = "系统媒体音量归零（影响整机全部媒体声）",
-        impactDescription = "无需 Shizuku，先持久化当前媒体音量与静音状态，再将系统 STREAM_MUSIC 设为 0；手机端所有媒体声均静音，停止或异常时自动恢复（若中途手动调高音量则保留新设置）。"
+        impactDescription = "无需 Shizuku，先持久化当前媒体音量与静音状态，再将系统 STREAM_MUSIC 设为 0；手机端所有媒体声均静音，停止或异常时自动恢复（若中途手动调高音量则保留新设置）。",
+        targetCardSummary = "完整 UID 白名单采集 + 整体媒体静音"
     ),
     CAPTURE_ONLY_UNMUTED(
         badgeLabel = "仅采集不静音",
         shortDescription = "不改手机音量（手机与音箱同时发声）",
-        impactDescription = "无需 Shizuku，仅按目标 UID 白名单采集音频发送至音箱，不修改任何手机音量或会话包络，本机与远端音箱同时发声。"
+        impactDescription = "无需 Shizuku，仅按目标 UID 白名单采集音频发送至音箱，不修改任何手机音量或会话包络，本机与远端音箱同时发声。",
+        targetCardSummary = "完整 UID 白名单采集 + 仅采集不静音"
     )
 }
 

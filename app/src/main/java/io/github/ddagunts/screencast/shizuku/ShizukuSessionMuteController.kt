@@ -33,6 +33,7 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 import rikka.shizuku.Shizuku
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicLong
 
 data class MultiProfileCatalogSnapshot(
     val profiles: List<UserProfileInfo>,
@@ -88,7 +89,13 @@ object ShizukuSessionMuteController {
     const val USER_SERVICE_PROTOCOL_VERSION: Int = 2
 
     private val controllerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val leaseLock = Any()
+    private val leaseGeneration = AtomicLong(0L)
+    @Volatile
+    private var activeLeaseGeneration: Long = 0L
+    @Volatile
     private var renewalJob: Job? = null
+    @Volatile
     private var sessionFailureHandler: ((String) -> Unit)? = null
 
     private val _muteTelemetry = MutableStateFlow(SessionMuteTelemetry())
@@ -103,6 +110,7 @@ object ShizukuSessionMuteController {
     }
 
     private val backendStateListener: (LeaseAcquisitionOutcome) -> Unit = { outcome ->
+        val isLeaseCurrentlyActive = activeLeaseGeneration != 0L
         _muteTelemetry.update { current ->
             val maxLat = outcome.maxObservedNewTrackMuteLatencyMs?.takeIf { it >= 0L }
                 ?: current.maxObservedNewTrackMuteLatencyMs
@@ -113,16 +121,23 @@ object ShizukuSessionMuteController {
                 outcome.pendingRestoreCount == 0 && outcome.success -> null
                 else -> current.muteFailureReason
             }
-            current.copy(
-                activeTargetPlayerCount = outcome.activeTargetPlayerCount,
-                confirmedMutedPlayerCount = outcome.confirmedMutedPlayerCount,
-                pendingRestoreCount = outcome.pendingRestoreCount,
-                lastMixerMutedByMask = outcome.lastMixerMutedByMask,
-                lastMuteConfirmationLatencyMs = lastLat,
-                maxObservedNewTrackMuteLatencyMs = maxLat,
-                isNewTrackLatencyWithinGate = maxLat?.let { it <= 100L } ?: current.isNewTrackLatencyWithinGate,
-                muteFailureReason = updatedFailureReason
-            )
+            if (!isLeaseCurrentlyActive && !current.leaseActive) {
+                current.copy(
+                    pendingRestoreCount = outcome.pendingRestoreCount,
+                    muteFailureReason = updatedFailureReason
+                )
+            } else {
+                current.copy(
+                    activeTargetPlayerCount = outcome.activeTargetPlayerCount,
+                    confirmedMutedPlayerCount = outcome.confirmedMutedPlayerCount,
+                    pendingRestoreCount = outcome.pendingRestoreCount,
+                    lastMixerMutedByMask = outcome.lastMixerMutedByMask,
+                    lastMuteConfirmationLatencyMs = lastLat,
+                    maxObservedNewTrackMuteLatencyMs = maxLat,
+                    isNewTrackLatencyWithinGate = maxLat?.let { it <= 100L } ?: current.isNewTrackLatencyWithinGate,
+                    muteFailureReason = updatedFailureReason
+                )
+            }
         }
     }
 
@@ -223,89 +238,83 @@ object ShizukuSessionMuteController {
     ): LeaseAcquisitionOutcome {
         renewalJob?.cancel()
         renewalJob = null
-        sessionFailureHandler = onFatalMuteError
 
-        syncShizukuConnectionState()
-        if (backend.connectionState.value != ShizukuConnectionState.READY) {
-            val msg = "Shizuku Shell 服务未就绪 (${backend.connectionState.value.statusLabel})，无法安全执行会话静音。"
-            _muteTelemetry.update {
-                it.copy(
-                    leaseActive = false,
-                    resolvedTargetUids = emptySet(),
-                    muteFailureReason = msg
-                )
-            }
-            return LeaseAcquisitionOutcome(success = false, error = msg)
-        }
+        val myGeneration: Long
+        val initialOutcome: LeaseAcquisitionOutcome
+        synchronized(leaseLock) {
+            renewalJob?.cancel()
+            renewalJob = null
+            myGeneration = leaseGeneration.incrementAndGet()
+            activeLeaseGeneration = 0L
+            sessionFailureHandler = onFatalMuteError
 
-        val initialOutcome = backend.acquireOrRenewLease(targetUids, LEASE_DURATION_MS)
-        if (!initialOutcome.success) {
-            val err = initialOutcome.error ?: "初始播放器会话静音确认失败。"
-            val releaseOutcome = if (initialOutcome.pendingRestoreCount > 0) {
-                initialOutcome
-            } else {
-                runCatching { backend.releaseLeaseImmediately() }.getOrDefault(initialOutcome)
-            }
-            _muteTelemetry.update {
-                it.copy(
-                    leaseActive = false,
-                    resolvedTargetUids = emptySet(),
-                    pendingRestoreCount = releaseOutcome.pendingRestoreCount.coerceAtLeast(initialOutcome.pendingRestoreCount),
-                    muteFailureReason = err
-                )
-            }
-            return initialOutcome.copy(
-                pendingRestoreCount = releaseOutcome.pendingRestoreCount.coerceAtLeast(initialOutcome.pendingRestoreCount),
-                error = err
-            )
-        }
-
-        val initialLat = initialOutcome.lastMuteConfirmationLatencyMs?.takeIf { it >= 0L }
-        val maxLat = initialOutcome.maxObservedNewTrackMuteLatencyMs?.takeIf { it >= 0L } ?: initialLat
-
-        _muteTelemetry.update {
-            it.copy(
-                shizukuState = backend.connectionState.value,
-                resolvedTargetUids = targetUids,
-                activeTargetPlayerCount = initialOutcome.activeTargetPlayerCount,
-                confirmedMutedPlayerCount = initialOutcome.confirmedMutedPlayerCount,
-                pendingRestoreCount = initialOutcome.pendingRestoreCount,
-                lastMixerMutedByMask = initialOutcome.lastMixerMutedByMask,
-                lastMuteConfirmationLatencyMs = initialLat,
-                maxObservedNewTrackMuteLatencyMs = maxLat,
-                isNewTrackLatencyWithinGate = maxLat?.let { ms -> ms <= 100L },
-                leaseActive = true,
-                leaseDurationMs = LEASE_DURATION_MS,
-                leaseRenewalCount = 1L,
-                muteFailureReason = null
-            )
-        }
-
-        renewalJob = controllerScope.launch {
-            while (isActive) {
-                delay(RENEWAL_INTERVAL_MS)
-                if (!isActive) break
-                val renewOutcome = backend.acquireOrRenewLease(targetUids, LEASE_DURATION_MS)
-                if (!renewOutcome.success) {
-                    val err = renewOutcome.error ?: "会话静音租约续期或新轨静音确认失败。"
-                    onRemoteMuteFailure(err, releaseRemotelyAsync = true)
-                    break
-                }
-                val latestLat = renewOutcome.lastMuteConfirmationLatencyMs?.takeIf { it >= 0L }
-                val latestMax = renewOutcome.maxObservedNewTrackMuteLatencyMs?.takeIf { it >= 0L }
-                _muteTelemetry.update { current ->
-                    val mergedMax = latestMax ?: current.maxObservedNewTrackMuteLatencyMs
-                    current.copy(
-                        activeTargetPlayerCount = renewOutcome.activeTargetPlayerCount,
-                        confirmedMutedPlayerCount = renewOutcome.confirmedMutedPlayerCount,
-                        pendingRestoreCount = renewOutcome.pendingRestoreCount,
-                        lastMixerMutedByMask = renewOutcome.lastMixerMutedByMask,
-                        lastMuteConfirmationLatencyMs = latestLat ?: current.lastMuteConfirmationLatencyMs,
-                        maxObservedNewTrackMuteLatencyMs = mergedMax,
-                        isNewTrackLatencyWithinGate = mergedMax?.let { ms -> ms <= 100L },
-                        leaseActive = true,
-                        leaseRenewalCount = current.leaseRenewalCount + 1L
+            syncShizukuConnectionState()
+            if (backend.connectionState.value != ShizukuConnectionState.READY) {
+                val msg = "Shizuku Shell 服务未就绪 (${backend.connectionState.value.statusLabel})，无法安全执行会话静音。"
+                _muteTelemetry.update {
+                    it.copy(
+                        leaseActive = false,
+                        resolvedTargetUids = emptySet(),
+                        muteFailureReason = msg
                     )
+                }
+                return LeaseAcquisitionOutcome(success = false, error = msg)
+            }
+
+            initialOutcome = backend.acquireOrRenewLease(targetUids, LEASE_DURATION_MS)
+            if (!initialOutcome.success) {
+                val err = initialOutcome.error ?: "初始播放器会话静音确认失败。"
+                val releaseOutcome = if (initialOutcome.pendingRestoreCount > 0) {
+                    initialOutcome
+                } else {
+                    runCatching { backend.releaseLeaseImmediately() }.getOrDefault(initialOutcome)
+                }
+                _muteTelemetry.update {
+                    it.copy(
+                        leaseActive = false,
+                        resolvedTargetUids = emptySet(),
+                        pendingRestoreCount = releaseOutcome.pendingRestoreCount.coerceAtLeast(initialOutcome.pendingRestoreCount),
+                        muteFailureReason = err
+                    )
+                }
+                return initialOutcome.copy(
+                    pendingRestoreCount = releaseOutcome.pendingRestoreCount.coerceAtLeast(initialOutcome.pendingRestoreCount),
+                    error = err
+                )
+            }
+
+            activeLeaseGeneration = myGeneration
+            val initialLat = initialOutcome.lastMuteConfirmationLatencyMs?.takeIf { it >= 0L }
+            val maxLat = initialOutcome.maxObservedNewTrackMuteLatencyMs?.takeIf { it >= 0L } ?: initialLat
+
+            _muteTelemetry.update {
+                it.copy(
+                    shizukuState = backend.connectionState.value,
+                    resolvedTargetUids = targetUids,
+                    activeTargetPlayerCount = initialOutcome.activeTargetPlayerCount,
+                    confirmedMutedPlayerCount = initialOutcome.confirmedMutedPlayerCount,
+                    pendingRestoreCount = initialOutcome.pendingRestoreCount,
+                    lastMixerMutedByMask = initialOutcome.lastMixerMutedByMask,
+                    lastMuteConfirmationLatencyMs = initialLat,
+                    maxObservedNewTrackMuteLatencyMs = maxLat,
+                    isNewTrackLatencyWithinGate = maxLat?.let { ms -> ms <= 100L },
+                    leaseActive = true,
+                    leaseDurationMs = LEASE_DURATION_MS,
+                    leaseRenewalCount = 1L,
+                    muteFailureReason = null
+                )
+            }
+
+            renewalJob = controllerScope.launch {
+                while (isActive && activeLeaseGeneration == myGeneration) {
+                    delay(RENEWAL_INTERVAL_MS)
+                    if (!isActive || activeLeaseGeneration != myGeneration) break
+                    val failure = performSingleRenewalStep(myGeneration, targetUids) { isActive }
+                    if (failure != null) {
+                        val err = failure.error ?: "会话静音租约续期或新轨静音确认失败。"
+                        onRemoteMuteFailure(err, releaseRemotelyAsync = true)
+                        break
+                    }
                 }
             }
         }
@@ -313,34 +322,86 @@ object ShizukuSessionMuteController {
         return initialOutcome
     }
 
+    internal fun runSingleRenewalForTesting() {
+        val gen = activeLeaseGeneration
+        val uids = _muteTelemetry.value.resolvedTargetUids
+        if (gen == 0L || uids.isEmpty()) return
+        performSingleRenewalStep(gen, uids) { true }
+    }
+
+    private fun performSingleRenewalStep(
+        myGeneration: Long,
+        targetUids: Set<Int>,
+        isJobActive: () -> Boolean
+    ): LeaseAcquisitionOutcome? {
+        var failedRenewalOutcome: LeaseAcquisitionOutcome? = null
+        synchronized(leaseLock) {
+            if (!isJobActive() || activeLeaseGeneration != myGeneration) {
+                return null
+            }
+            val renewOutcome = backend.acquireOrRenewLease(targetUids, LEASE_DURATION_MS)
+            if (activeLeaseGeneration != myGeneration) {
+                // Lease was stopped concurrently or superseded; ensure remote lease is released
+                runCatching { backend.releaseLeaseImmediately() }
+                return null
+            }
+            if (!renewOutcome.success) {
+                failedRenewalOutcome = renewOutcome
+                return@synchronized
+            }
+            val latestLat = renewOutcome.lastMuteConfirmationLatencyMs?.takeIf { it >= 0L }
+            val latestMax = renewOutcome.maxObservedNewTrackMuteLatencyMs?.takeIf { it >= 0L }
+            _muteTelemetry.update { current ->
+                val mergedMax = latestMax ?: current.maxObservedNewTrackMuteLatencyMs
+                current.copy(
+                    activeTargetPlayerCount = renewOutcome.activeTargetPlayerCount,
+                    confirmedMutedPlayerCount = renewOutcome.confirmedMutedPlayerCount,
+                    pendingRestoreCount = renewOutcome.pendingRestoreCount,
+                    lastMixerMutedByMask = renewOutcome.lastMixerMutedByMask,
+                    lastMuteConfirmationLatencyMs = latestLat ?: current.lastMuteConfirmationLatencyMs,
+                    maxObservedNewTrackMuteLatencyMs = mergedMax,
+                    isNewTrackLatencyWithinGate = mergedMax?.let { ms -> ms <= 100L },
+                    leaseActive = true,
+                    leaseRenewalCount = current.leaseRenewalCount + 1L
+                )
+            }
+        }
+        return failedRenewalOutcome
+    }
+
     fun stopLeaseAndRestoreImmediately(failureReason: String? = null): LeaseAcquisitionOutcome {
-        val job = renewalJob
-        renewalJob = null
-        job?.cancel()
-        sessionFailureHandler = null
-        val releaseOutcome = runCatching {
-            backend.releaseLeaseImmediately()
-        }.getOrElse { e ->
-            LeaseAcquisitionOutcome(
-                success = false,
-                error = "释放会话静音租约异常：${e.message}"
-            )
+        renewalJob?.cancel()
+        return synchronized(leaseLock) {
+            leaseGeneration.incrementAndGet()
+            activeLeaseGeneration = 0L
+            val job = renewalJob
+            renewalJob = null
+            job?.cancel()
+            sessionFailureHandler = null
+            val releaseOutcome = runCatching {
+                backend.releaseLeaseImmediately()
+            }.getOrElse { e ->
+                LeaseAcquisitionOutcome(
+                    success = false,
+                    error = "释放会话静音租约异常：${e.message}"
+                )
+            }
+            val effectiveError = when {
+                !releaseOutcome.success -> releaseOutcome.error ?: failureReason ?: "部分受控音频会话尚未确认恢复"
+                failureReason != null -> failureReason
+                else -> null
+            }
+            _muteTelemetry.update { current ->
+                current.copy(
+                    leaseActive = false,
+                    activeTargetPlayerCount = releaseOutcome.activeTargetPlayerCount,
+                    confirmedMutedPlayerCount = releaseOutcome.confirmedMutedPlayerCount,
+                    pendingRestoreCount = releaseOutcome.pendingRestoreCount,
+                    muteFailureReason = effectiveError ?: if (releaseOutcome.pendingRestoreCount > 0) current.muteFailureReason else null
+                )
+            }
+            releaseOutcome.copy(error = effectiveError)
         }
-        val effectiveError = when {
-            !releaseOutcome.success -> releaseOutcome.error ?: failureReason ?: "部分受控音频会话尚未确认恢复"
-            failureReason != null -> failureReason
-            else -> null
-        }
-        _muteTelemetry.update { current ->
-            current.copy(
-                leaseActive = false,
-                activeTargetPlayerCount = releaseOutcome.activeTargetPlayerCount,
-                confirmedMutedPlayerCount = releaseOutcome.confirmedMutedPlayerCount,
-                pendingRestoreCount = releaseOutcome.pendingRestoreCount,
-                muteFailureReason = effectiveError ?: if (releaseOutcome.pendingRestoreCount > 0) current.muteFailureReason else null
-            )
-        }
-        return releaseOutcome.copy(error = effectiveError)
     }
 
     fun hasActiveStartedPlaybackForUids(targetUids: Set<Int>): Boolean {
@@ -367,6 +428,8 @@ object ShizukuSessionMuteController {
      * `releaseMuteLease` on the incoming Binder callback stack.
      */
     private fun onRemoteMuteFailure(reason: String, releaseRemotelyAsync: Boolean = false) {
+        leaseGeneration.incrementAndGet()
+        activeLeaseGeneration = 0L
         val job = renewalJob
         renewalJob = null
         job?.cancel()
@@ -704,6 +767,11 @@ internal class RealShizukuMuteBackend : ShizukuMuteBackend {
                     } else {
                         ApplicationInfo.CATEGORY_UNDEFINED
                     }
+                    val isIdentityVerified = if (item.has("isIdentityVerified")) {
+                        item.optBoolean("isIdentityVerified", uid != null && uid > 0)
+                    } else {
+                        uid != null && uid > 0
+                    }
                     add(
                         TargetAppEntry(
                             target = CaptureTarget(pkg, serial),
@@ -716,6 +784,7 @@ internal class RealShizukuMuteBackend : ShizukuMuteBackend {
                             appCategory = appCategory,
                             resolvedUid = uid,
                             sharedUidPackages = siblings,
+                            isIdentityVerified = isIdentityVerified,
                             statusReason = reason
                         )
                     )

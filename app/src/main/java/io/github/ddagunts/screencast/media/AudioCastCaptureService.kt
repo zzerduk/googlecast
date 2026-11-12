@@ -47,6 +47,10 @@ import kotlin.math.roundToInt
 
 object AudioCastSessionCoordinator {
     private val muteStateMutex = Mutex()
+    private val coordinatorIoScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    @Volatile
+    private var lastRestoreJob: Job? = null
 
     private val _config = MutableStateFlow(AudioStreamConfig())
     val config: StateFlow<AudioStreamConfig> = _config.asStateFlow()
@@ -84,18 +88,26 @@ object AudioCastSessionCoordinator {
         }
     }
 
-    internal fun tryRestorePhoneAudioImmediate(
+    /**
+     * Launches phone audio restoration asynchronously on [Dispatchers.IO] so callers on the
+     * main thread never block on Shizuku Binder IPC or DataStore writes.
+     */
+    internal fun launchRestoreAsync(
         appContext: Context?,
-        failureReason: String? = null
-    ): Pair<Boolean, String?> {
-        if (!muteStateMutex.tryLock()) {
-            return false to null
+        failureReason: String? = null,
+        onComplete: ((String?) -> Unit)? = null
+    ): Job {
+        val job = coordinatorIoScope.launch {
+            val restoreErr = restorePhoneAudioSerialized(appContext, failureReason)
+            onComplete?.invoke(restoreErr)
         }
-        return try {
-            true to restorePhoneAudioLocked(appContext, failureReason)
-        } finally {
-            muteStateMutex.unlock()
-        }
+        lastRestoreJob = job
+        return job
+    }
+
+    internal suspend fun awaitPendingRestoreForTesting() {
+        lastRestoreJob?.join()
+        muteStateMutex.withLock { }
     }
 
     internal fun restorePhoneAudioLocked(
@@ -160,10 +172,13 @@ object AudioCastSessionCoordinator {
         }
     }
 
-    fun markCleanupTimeout(message: String, appContext: Context? = null) {
-        val restoreError = restorePhoneAudioLocked(appContext, failureReason = message)
-        val combinedMessage = combineErrorMessages(message, restoreError) ?: message
+    fun markCleanupTimeout(
+        message: String,
+        appContext: Context? = null,
+        alreadyRestored: Boolean = false
+    ) {
         isCaptureLocked = true
+        CaptureTargetRepository.clearFrozenTargetsSnapshot()
         _telemetry.update { current ->
             current.copy(
                 isStreaming = false,
@@ -172,10 +187,24 @@ object AudioCastSessionCoordinator {
                 hasValidAudioSignal = false,
                 webRtcStage = WebRtcStage.CLEANUP_TIMEOUT,
                 isCaptureLocked = true,
-                error = combinedMessage
+                error = combineErrorMessages(message, current.error) ?: message
             )
         }
-        appendLog("Audio cast cleanup timed out: $combinedMessage")
+        appendLog("Audio cast cleanup locked: $message")
+        if (!alreadyRestored) {
+            launchRestoreAsync(
+                appContext = appContext,
+                failureReason = message
+            ) { restoreError ->
+                if (!restoreError.isNullOrBlank()) {
+                    _telemetry.update { current ->
+                        current.copy(
+                            error = combineErrorMessages(current.error ?: message, restoreError) ?: message
+                        )
+                    }
+                }
+            }
+        }
     }
 
     internal fun combineErrorMessages(primary: String?, secondary: String?): String? {
@@ -189,6 +218,13 @@ object AudioCastSessionCoordinator {
     }
 
     internal fun resetForTesting(appContext: Context? = null) {
+        val pendingJob = lastRestoreJob
+        lastRestoreJob = null
+        if (pendingJob != null) {
+            kotlinx.coroutines.runBlocking {
+                runCatching { pendingJob.join() }
+            }
+        }
         ShizukuSessionMuteController.stopLeaseAndRestoreImmediately()
         if (appContext != null) {
             PhoneGlobalMediaMuteController.resetForTesting(appContext)
@@ -752,33 +788,44 @@ class AudioCastCaptureService : Service() {
                 if (session?.isCleanupTimedOut == true) {
                     timedOutCleanup = true
                 }
-                if (!timedOutCleanup) {
+                if (session?.isCleanupFailed == true) {
+                    nativeCleanupFailed = true
+                }
+                if (!timedOutCleanup && !nativeCleanupFailed) {
                     runCatching { startingJob?.join() }
                 }
                 webRtcChannel?.endSession()
                 webRtcChannel = null
             } finally {
-                if (timedOutCleanup) {
+                if (timedOutCleanup || nativeCleanupFailed) {
                     cleanupTimedOut = true
                     sessionRunning = false
                     stopping = false
-                    val timeoutMessage = finalError
-                        ?: "WebRTC native audio cleanup timed out; capture is locked in this process."
-                    AudioCastSessionCoordinator.markCleanupTimeout(timeoutMessage, applicationContext)
+                    val lockMessage = finalError
+                        ?: if (timedOutCleanup) {
+                            "WebRTC native audio cleanup timed out; capture is locked in this process."
+                        } else {
+                            "WebRTC native audio cleanup failed; capture is locked in this process."
+                        }
+                    AudioCastSessionCoordinator.markCleanupTimeout(
+                        message = lockMessage,
+                        appContext = applicationContext,
+                        alreadyRestored = true
+                    )
                     if (!destroyed) {
                         val nm = getSystemService(NotificationManager::class.java)
                         nm?.notify(
                             NOTIFICATION_ID,
                             buildForegroundNotification(
                                 isCleanupTimedOut = true,
-                                timeoutMessage = timeoutMessage
+                                timeoutMessage = lockMessage
                             )
                         )
                     }
                 } else {
                     val projection = mediaProjection
                     mediaProjection = null
-                    if (!nativeCleanupFailed && projection != null) {
+                    if (projection != null) {
                         withContext(Dispatchers.IO) {
                             runCatching { projection.stop() }.onFailure {
                                 finalError = AudioCastSessionCoordinator.combineErrorMessages(
